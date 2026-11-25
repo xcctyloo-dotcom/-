@@ -1,53 +1,16 @@
 name: build-ipa
-
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main ]
-
+on: workflow_dispatch
 jobs:
   build:
-        runs-on: macos-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install tools
-        run: brew install xcodegen ldid
-
-      - name: Generate project
-        run: xcodegen generate
-
-      - name: Build unsigned app
-        run: |
-          xcodebuild \
-            -project CarPlayCast.xcodeproj \
-            -target CarPlayCast \
-            -configuration Release \
-            -sdk iphoneos \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            SYMROOT="$PWD/build/sym" \
-            build
-
-      - name: Sign with ldid (CarPlay entitlement)
-        run: |
-          APP="build/sym/Release-iphoneos/CarPlayCast.app"
-          ldid -S"CarPlayCast.entitlements" "$APP/CarPlayCast"
-          echo "--- signed entitlements ---"
-          ldid -e "$APP/CarPlayCast"
-
-      - name: Package IPA
-        run: |
-          APP="build/sym/Release-iphoneos/CarPlayCast.app"
-          mkdir -p build/Payload
-          cp -R "$APP" build/Payload/
-          rm -rf "build/Payload/CarPlayCast.app/_CodeSignature"
-          cd build && zip -qry CarPlayCast.ipa Payload
-          ls -lh CarPlayCast.ipa
-
+      - run: brew install xcodegen ldid
+      - run: xcodegen generate
+      - run: xcodebuild -project CarPlayCast.xcodeproj -target CarPlayCast -configuration Release -sdk iphoneos CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO SYMROOT=$PWD/build/sym build
+      - run: ldid -S"CarPlayCast.entitlements" build/sym/Release-iphoneos/CarPlayCast.app/CarPlayCast
+      - run: mkdir -p build/Payload && cp -R build/sym/Release-iphoneos/CarPlayCast.app build/Payload/ && rm -rf build/Payload/CarPlayCast.app/_CodeSignature && cd build && zip -qry CarPlayCast.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
           name: CarPlayCast-ipa
           path: build/CarPlayCast.ipa
-          retention-days: 14
