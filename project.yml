@@ -1,0 +1,29 @@
+name: CarPlayCast
+options:
+  bundleIdPrefix: com.dsh
+  deploymentTarget:
+    iOS: "16.4"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    TARGETED_DEVICE_FAMILY: "1"
+    ENABLE_BITCODE: NO
+
+targets:
+  CarPlayCast:
+    type: application
+    platform: iOS
+    sources:
+      - App.swift
+    settings:
+      base:
+        INFOPLIST_FILE: Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.dsh.carplaycast
+        PRODUCT_NAME: CarPlayCast
+        # 出未签名包，签名交给 ldid
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
