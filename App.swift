@@ -4,6 +4,45 @@ import MediaPlayer
 import UIKit
 import UniformTypeIdentifiers
 
+// MARK: - 工具
+
+enum Format {
+    static func time(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "0:00" }
+        let total = Int(seconds.rounded())
+        if total >= 3600 {
+            return String(format: "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
+        }
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
+
+    static func duration(_ seconds: TimeInterval) -> String {
+        let s = Int(max(0, seconds).rounded())
+        if s >= 3600 { return "\(s / 3600) 小时 \((s % 3600) / 60) 分" }
+        if s >= 60 { return "\(s / 60) 分 \(s % 60) 秒" }
+        return "\(s) 秒"
+    }
+
+    static func bytes(_ value: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: value, countStyle: .file)
+    }
+}
+
+/// 每次启动清掉上次留下的临时拷贝，避免越积越多
+enum TempCleaner {
+    static func clean() {
+        let tmp = FileManager.default.temporaryDirectory
+        guard let items = try? FileManager.default.contentsOfDirectory(at: tmp,
+                                                                       includingPropertiesForKeys: nil) else { return }
+        for url in items {
+            let name = url.lastPathComponent
+            if name.hasPrefix("source.") || name == "audio.m4a" {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+}
+
 // MARK: - App 入口
 
 @main
@@ -11,6 +50,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        TempCleaner.clean()
         AudioHub.shared.configureSession()
         return true
     }
@@ -24,8 +64,6 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         return UISceneConfiguration(name: "Default Configuration", sessionRole: connectingSceneSession.role)
     }
 }
-
-// MARK: - 手机主屏
 
 final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
@@ -42,44 +80,99 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 }
 
+// MARK: - 主菜单
+
 final class MenuViewController: UIViewController {
+
+    private let scroll = UIScrollView()
+    private let stack = UIStackView()
 
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "CarPlayCast"
-        view.backgroundColor = .systemBackground
+        view.backgroundColor = .systemGroupedBackground
 
-        let carplay = makeButton("车载播放（车机端）") { [weak self] in
-            self?.showAlert("插上 CarPlay 后，车机主屏会出现「车载播放」列表。")
-        }
-        let video = makeButton("视频同步（画面在手机）") { [weak self] in
-            self?.navigationController?.pushViewController(VideoSyncViewController(), animated: true)
-        }
-        let compensate = makeButton("补偿版导出（给 CarMovie 用）") { [weak self] in
-            self?.navigationController?.pushViewController(CompensateViewController(), animated: true)
-        }
-
-        let stack = UIStackView(arrangedSubviews: [carplay, video, compensate])
+        scroll.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .vertical
-        stack.spacing = 14
+        stack.spacing = 12
         stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
+
+        view.addSubview(scroll)
+        scroll.addSubview(stack)
 
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
-            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+            scroll.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+            stack.topAnchor.constraint(equalTo: scroll.topAnchor, constant: 16),
+            stack.bottomAnchor.constraint(equalTo: scroll.bottomAnchor, constant: -24),
+            stack.leadingAnchor.constraint(equalTo: scroll.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: scroll.trailingAnchor, constant: -16),
+            stack.widthAnchor.constraint(equalTo: scroll.widthAnchor, constant: -32)
         ])
+
+        build()
     }
 
-    private func makeButton(_ title: String, _ action: @escaping () -> Void) -> UIButton {
+    private func build() {
+        addSection("车机")
+        addCard("车载播放", "车机主屏出现「车载播放」列表，播放测试音") { [weak self] in
+            self?.showAlert("插上 CarPlay 后，车机主屏会出现「车载播放」。\n\n如果没出现，是 CarPlay 权限没被系统认，和代码无关。")
+        }
+
+        addSection("手机播放 · 声音走车机")
+        addCard("视频同步", "画面在手机，声音走车机，可调音画偏移") { [weak self] in
+            self?.navigationController?.pushViewController(VideoSyncViewController(), animated: true)
+        }
+
+        addSection("给车机播放器用（CarMovie 等）")
+        addCard("补偿版导出", "把音画偏移焊进文件，导出可直接播的 MP4") { [weak self] in
+            self?.navigationController?.pushViewController(CompensateViewController(), animated: true)
+        }
+        addCard("已导出文件", "查看、分享、删除导出的视频") { [weak self] in
+            self?.navigationController?.pushViewController(ExportedFilesViewController(), animated: true)
+        }
+
+        addSection("说明")
+        addCard("这个 App 能做什么", "三种模式的区别与各自的上限") { [weak self] in
+            self?.navigationController?.pushViewController(AboutViewController(), animated: true)
+        }
+
+        let footer = UILabel()
+        footer.numberOfLines = 0
+        footer.font = .systemFont(ofSize: 12)
+        footer.textColor = .tertiaryLabel
+        footer.text = "CarPlay 没有公开的视频通道。车机上放视频只能靠私有接口（CarMovie 那种），本 App 不做。"
+        stack.addArrangedSubview(footer)
+    }
+
+    private func addSection(_ title: String) {
+        let label = UILabel()
+        label.text = title
+        label.font = .preferredFont(forTextStyle: .footnote)
+        label.textColor = .secondaryLabel
+        let box = UIStackView(arrangedSubviews: [label])
+        box.isLayoutMarginsRelativeArrangement = true
+        box.layoutMargins = UIEdgeInsets(top: 8, left: 4, bottom: 0, right: 4)
+        stack.addArrangedSubview(box)
+    }
+
+    private func addCard(_ title: String, _ subtitle: String, _ action: @escaping () -> Void) {
         var config = UIButton.Configuration.filled()
         config.title = title
-        config.cornerStyle = .medium
+        config.subtitle = subtitle
+        config.cornerStyle = .large
+        config.baseBackgroundColor = .secondarySystemGroupedBackground
+        config.baseForegroundColor = .label
         config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16)
-        let b = UIButton(configuration: config)
-        b.addAction(UIAction { _ in action() }, for: .touchUpInside)
-        return b
+        config.titleAlignment = .leading
+
+        let button = UIButton(configuration: config)
+        button.contentHorizontalAlignment = .leading
+        button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+        stack.addArrangedSubview(button)
     }
 
     private func showAlert(_ text: String) {
@@ -131,7 +224,7 @@ final class CarPlaySceneDelegate: UIResponder, CPTemplateApplicationSceneDelegat
 
 // MARK: - 音频
 
-/// 运行时合成一段 440Hz 测试音，省掉二进制资源，工程全是文本文件
+/// 运行时合成 440Hz 测试音，省掉二进制资源
 enum ToneFile {
 
     static func url() -> URL? {
@@ -139,8 +232,8 @@ enum ToneFile {
         if FileManager.default.fileExists(atPath: dst.path) { return dst }
 
         let sampleRate = 44100
-        let count = sampleRate * 2          // 2 秒
-        let dataLen = count * 2             // 16-bit mono
+        let count = sampleRate * 2
+        let dataLen = count * 2
         var data = Data()
 
         func put<T: FixedWidthInteger>(_ v: T) {
@@ -168,7 +261,7 @@ enum ToneFile {
             try data.write(to: dst)
             return dst
         } catch {
-            NSLog("CarPlayCast: tone write failed \(error)")
+            NSLog("tone write failed: \(error)")
             return nil
         }
     }
@@ -178,24 +271,23 @@ final class AudioHub {
 
     static let shared = AudioHub()
     private var player: AVAudioPlayer?
-    private var sessionConfigured = false
+    private var configured = false
 
     private init() {}
 
     var isPlaying: Bool { player?.isPlaying ?? false }
 
     func configureSession() {
-        guard !sessionConfigured else { return }
-        sessionConfigured = true
+        guard !configured else { return }
+        configured = true
 
-        let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playback, mode: .default, options: [])
-            try session.setActive(true)
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+            try AVAudioSession.sharedInstance().setActive(true)
         } catch {
-            NSLog("CarPlayCast session error: \(error)")
+            NSLog("audio session: \(error)")
         }
-        installRemoteCommands()
+        installRemote()
         refreshNowPlaying()
     }
 
@@ -221,7 +313,7 @@ final class AudioHub {
         return p
     }
 
-    private func installRemoteCommands() {
+    private func installRemote() {
         let center = MPRemoteCommandCenter.shared()
         center.playCommand.addTarget { _ in AudioHub.shared.play(); return .success }
         center.pauseCommand.addTarget { _ in AudioHub.shared.stop(); return .success }
@@ -244,15 +336,19 @@ final class VideoSyncViewController: UIViewController {
     private let playerLayer = AVPlayerLayer()
     private let panel = UIStackView()
 
-    private let infoLabel = UILabel()
     private let offsetLabel = UILabel()
     private let statusLabel = UILabel()
-    private let slider = UISlider()
+    private let timeLabel = UILabel()
+    private let seekBar = UISlider()
+    private let offsetSlider = UISlider()
 
     private var videoPlayer: AVPlayer?
     private var audioPlayer: AVAudioPlayer?
     private var pending: DispatchWorkItem?
-    private var watchdog: Timer?
+    private var ticker: Timer?
+    private var lastCorrection = Date.distantPast
+    private var playbackOffset: Double = 0
+    private var isSeeking = false
 
     private var offsetMs: Double {
         get { UserDefaults.standard.double(forKey: "syncOffsetMs") }
@@ -261,6 +357,7 @@ final class VideoSyncViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        title = "视频同步"
         view.backgroundColor = .black
         playerLayer.videoGravity = .resizeAspect
         view.layer.addSublayer(playerLayer)
@@ -277,27 +374,34 @@ final class VideoSyncViewController: UIViewController {
         stopAll()
     }
 
-    private func buildPanel() {
-        infoLabel.text = "① 选视频  ② 播放  ③ 用滑杆把声音对齐画面"
-        infoLabel.font = .systemFont(ofSize: 13)
-        infoLabel.textColor = .white
-        infoLabel.numberOfLines = 0
+    // MARK: UI
 
-        offsetLabel.font = .monospacedDigitSystemFont(ofSize: 15, weight: .semibold)
+    private func buildPanel() {
+        offsetLabel.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
         offsetLabel.textColor = .systemYellow
+
+        timeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        timeLabel.textColor = .white
+        timeLabel.textAlignment = .right
 
         statusLabel.font = .systemFont(ofSize: 12)
         statusLabel.textColor = .systemGray
         statusLabel.numberOfLines = 0
 
-        slider.minimumValue = 0
-        slider.maximumValue = 600
-        slider.addTarget(self, action: #selector(sliderChanged), for: .valueChanged)
+        offsetSlider.minimumValue = 0
+        offsetSlider.maximumValue = 600
+        offsetSlider.addTarget(self, action: #selector(offsetChanged), for: .valueChanged)
+
+        seekBar.minimumValue = 0
+        seekBar.maximumValue = 1
+        seekBar.addTarget(self, action: #selector(seekBegan), for: .touchDown)
+        seekBar.addTarget(self, action: #selector(seekChanged), for: .valueChanged)
+        seekBar.addTarget(self, action: #selector(seekEnded), for: [.touchUpInside, .touchUpOutside, .touchCancel])
 
         let row = UIStackView(arrangedSubviews: [
             makeButton("选视频", #selector(pickVideo)),
-            makeButton("播放", #selector(playTapped)),
-            makeButton("暂停", #selector(pauseTapped))
+            makeButton("播放/暂停", #selector(togglePlay)),
+            makeButton("回退 10s", #selector(backTen))
         ])
         row.axis = .horizontal
         row.distribution = .fillEqually
@@ -314,7 +418,8 @@ final class VideoSyncViewController: UIViewController {
         panel.axis = .vertical
         panel.spacing = 10
         panel.translatesAutoresizingMaskIntoConstraints = false
-        [infoLabel, offsetLabel, slider, fine, row, statusLabel].forEach { panel.addArrangedSubview($0) }
+        [offsetLabel, offsetSlider, fine, seekBar, timeLabel, row, statusLabel]
+            .forEach { panel.addArrangedSubview($0) }
 
         let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
         blur.translatesAutoresizingMaskIntoConstraints = false
@@ -331,25 +436,25 @@ final class VideoSyncViewController: UIViewController {
             panel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -10)
         ])
 
-        refreshLabel()
+        refreshOffsetLabel()
     }
 
     private func makeButton(_ title: String, _ action: Selector) -> UIButton {
         let b = UIButton(type: .system)
         b.setTitle(title, for: .normal)
-        b.titleLabel?.font = .systemFont(ofSize: 15, weight: .medium)
+        b.titleLabel?.font = .systemFont(ofSize: 14, weight: .medium)
         b.addTarget(self, action: action, for: .touchUpInside)
-        b.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        b.heightAnchor.constraint(equalToConstant: 38).isActive = true
         return b
     }
 
-    private func refreshLabel() {
-        offsetLabel.text = String(format: "补偿 %.0f ms", offsetMs)
+    private func refreshOffsetLabel() {
+        offsetLabel.text = String(format: "音画补偿 %.0f ms（画面延后）", offsetMs)
     }
 
-    @objc private func sliderChanged() {
-        offsetMs = Double(slider.value).rounded()
-        refreshLabel()
+    @objc private func offsetChanged() {
+        offsetMs = Double(offsetSlider.value).rounded()
+        refreshOffsetLabel()
     }
 
     @objc private func minusTapped() { nudge(-10) }
@@ -357,9 +462,11 @@ final class VideoSyncViewController: UIViewController {
 
     private func nudge(_ delta: Double) {
         offsetMs = min(600, max(0, offsetMs + delta))
-        slider.value = Float(offsetMs)
-        refreshLabel()
+        offsetSlider.value = Float(offsetMs)
+        refreshOffsetLabel()
     }
+
+    // MARK: 载入
 
     @objc private func pickVideo() {
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.movie], asCopy: true)
@@ -381,9 +488,9 @@ final class VideoSyncViewController: UIViewController {
         playerLayer.player = player
 
         statusLabel.text = "正在分离音轨…"
+        offsetSlider.value = Float(offsetMs)
+        refreshOffsetLabel()
         extractAudio(from: asset, presets: [AVAssetExportPresetPassthrough, AVAssetExportPresetAppleM4A])
-        slider.value = Float(offsetMs)
-        refreshLabel()
     }
 
     private func extractAudio(from asset: AVAsset, presets: [String]) {
@@ -392,7 +499,7 @@ final class VideoSyncViewController: UIViewController {
             return
         }
         guard let preset = presets.first else {
-            statusLabel.text = "音轨分离失败：这个格式不支持"
+            statusLabel.text = "音轨分离失败：格式不支持，已取消静音（能听但不同步）"
             videoPlayer?.isMuted = false
             return
         }
@@ -412,60 +519,127 @@ final class VideoSyncViewController: UIViewController {
                 return
             }
             DispatchQueue.main.async {
-                guard let p = try? AVAudioPlayer(contentsOf: out) else { return }
-                p.prepareToPlay()
-                self?.audioPlayer = p
-                self?.statusLabel.text = "音轨已分离，可以调同步了"
+                guard let player = try? AVAudioPlayer(contentsOf: out) else { return }
+                player.prepareToPlay()
+                self?.audioPlayer = player
+                self?.seekBar.maximumValue = Float(player.duration)
+                self?.statusLabel.text = "就绪 · 拖动上面的进度条可以跳转"
             }
         }
     }
 
-    @objc private func playTapped() {
+    // MARK: 播放控制
+
+    @objc private func togglePlay() {
+        if audioPlayer?.isPlaying == true {
+            stopAll()
+        } else {
+            startPlayback(x: 0)
+        }
+    }
+
+    private func startPlayback(x: Double) {
         guard let videoPlayer, let audioPlayer else {
-            statusLabel.text = "还没选视频，或者音轨分离没完成"
+            statusLabel.text = "还没选视频，或者音轨还没分离完"
             return
         }
         pending?.cancel()
 
-        audioPlayer.currentTime = 0
-        videoPlayer.seek(to: .zero)
-        audioPlayer.play()
+        audioPlayer.currentTime = max(0, min(x, audioPlayer.duration - 0.05))
+        let videoTime = max(0, audioPlayer.currentTime - offsetMs / 1000)
+        videoPlayer.seek(to: CMTime(seconds: videoTime, preferredTimescale: 600))
 
+        audioPlayer.play()
         let delay = max(0, offsetMs) / 1000.0
         let work = DispatchWorkItem { [weak self] in
             self?.videoPlayer?.play()
-            self?.startWatchdog()
+            self?.startTicker()
         }
         pending = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    @objc private func pauseTapped() { stopAll() }
-
     private func stopAll() {
         pending?.cancel()
-        watchdog?.invalidate()
-        watchdog = nil
+        ticker?.invalidate()
+        ticker = nil
         audioPlayer?.pause()
         videoPlayer?.pause()
     }
 
-    private func startWatchdog() {
-        watchdog?.invalidate()
-        watchdog = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.checkDrift()
+    @objc private func backTen() {
+        guard let audio = audioPlayer else { return }
+        let target = max(0, audio.currentTime - 10)
+        if audio.isPlaying {
+            startPlayback(x: target)
+        } else {
+            audio.currentTime = target
+            videoPlayer?.seek(to: CMTime(seconds: max(0, target - offsetMs / 1000), preferredTimescale: 600))
+            updateTimeLabel()
         }
     }
 
-    private func checkDrift() {
-        guard let audio = audioPlayer, let video = videoPlayer, audio.isPlaying else { return }
+    // MARK: 进度条
+
+    @objc private func seekBegan() { isSeeking = true }
+
+    @objc private func seekChanged() {
+        timeLabel.text = "\(Format.time(Double(seekBar.value))) / \(Format.time(audioPlayer?.duration ?? 0))"
+    }
+
+    @objc private func seekEnded() {
+        guard let audio = audioPlayer else { return }
+        let wasPlaying = audio.isPlaying
+        stopAll()
+        let target = Double(seekBar.value)
+        if wasPlaying {
+            isSeeking = false
+            startPlayback(x: target)
+        } else {
+            audio.currentTime = target
+            videoPlayer?.seek(to: CMTime(seconds: max(0, target - offsetMs / 1000), preferredTimescale: 600))
+            isSeeking = false
+            updateTimeLabel()
+        }
+    }
+
+    // MARK: 定时器：刷新进度 + 纠偏
+
+    private func startTicker() {
+        ticker?.invalidate()
+        ticker = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+        if let ticker { RunLoop.main.add(ticker, forMode: .common) }
+    }
+
+    private func tick() {
+        guard let audio = audioPlayer, let video = videoPlayer else { return }
+
+        if !isSeeking {
+            seekBar.value = Float(audio.currentTime)
+        }
+        updateTimeLabel()
+
+        guard audio.isPlaying else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastCorrection) > 2 else { return }
+        lastCorrection = now
+
         let audioTimeline = audio.currentTime - offsetMs / 1000
         let videoTime = video.currentTime().seconds
         guard videoTime.isFinite else { return }
         if abs(audioTimeline - videoTime) > 0.12 {
-            let target = CMTime(seconds: max(0, audioTimeline), preferredTimescale: 600)
-            video.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+            video.seek(to: CMTime(seconds: max(0, audioTimeline), preferredTimescale: 600),
+                       toleranceBefore: .zero, toleranceAfter: .zero)
+            statusLabel.text = "已自动纠偏一次"
         }
+    }
+
+    private func updateTimeLabel() {
+        let current = audioPlayer?.currentTime ?? 0
+        let duration = audioPlayer?.duration ?? 0
+        timeLabel.text = "\(Format.time(current)) / \(Format.time(duration))"
     }
 }
 
@@ -476,7 +650,7 @@ extension VideoSyncViewController: UIDocumentPickerDelegate {
     }
 }
 
-// MARK: - 补偿版导出（给 CarMovie 这类车机播放器用）
+// MARK: - 补偿导出
 
 enum CompensateError: LocalizedError {
     case noVideoTrack
@@ -485,15 +659,50 @@ enum CompensateError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noVideoTrack: return "这个文件没有视频轨"
-        case .exportFailed(let m): return "导出失败：\(m)"
+        case .exportFailed(let message): return "导出失败：\(message)"
         }
     }
 }
 
 enum CompensateExporter {
 
-    /// offsetMs > 0：音频后移（声音偏早）；offsetMs < 0：画面后移（声音偏晚）
-    static func export(source: URL, offsetMs: Double, completion: @escaping (Result<URL, Error>) -> Void) {
+    static var timer: Timer?
+    static var current: AVAssetExportSession?
+
+    /// 先试直通（只改写时间戳，最快），失败再退回重编码
+    private static let presets = [
+        AVAssetExportPresetPassthrough,
+        AVAssetExportPreset1280x720,
+        AVAssetExportPresetHighestQuality
+    ]
+
+    static func cancel() {
+        current?.cancelExport()
+        timer?.invalidate()
+        timer = nil
+    }
+
+    static func documentsDir() -> URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    }
+
+    static func freeSpace() -> Int64 {
+        let values = try? documentsDir().resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return Int64(values?.volumeAvailableCapacityForImportantUsage ?? 0)
+    }
+
+    static func outputURL(source: URL, offsetMs: Double) -> URL {
+        let base = source.deletingPathExtension().lastPathComponent
+        let sign = offsetMs >= 0 ? "p" : "m"
+        let stamp = Int(Date().timeIntervalSince1970)
+        return documentsDir().appendingPathComponent("\(base)_\(sign)\(Int(abs(offsetMs)))ms_\(stamp).mp4")
+    }
+
+    /// offsetMs > 0：音频后移；offsetMs < 0：画面后移
+    static func export(source: URL,
+                       offsetMs: Double,
+                       progress: @escaping (Double) -> Void,
+                       completion: @escaping (Result<URL, Error>) -> Void) {
         let asset = AVURLAsset(url: source)
 
         guard let videoTrack = asset.tracks(withMediaType: .video).first else {
@@ -514,42 +723,76 @@ enum CompensateExporter {
             ? nil
             : composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
 
-        let videoStart = offsetMs < 0 ? shift : .zero
-        let audioStart = offsetMs > 0 ? shift : .zero
-
         do {
             try compVideo.insertTimeRange(CMTimeRange(start: .zero, duration: duration),
-                                          of: videoTrack, at: videoStart)
+                                          of: videoTrack,
+                                          at: offsetMs < 0 ? shift : .zero)
             if let audioTrack, let compAudio {
                 try compAudio.insertTimeRange(CMTimeRange(start: .zero, duration: duration),
-                                              of: audioTrack, at: audioStart)
+                                              of: audioTrack,
+                                              at: offsetMs > 0 ? shift : .zero)
             }
         } catch {
             completion(.failure(CompensateError.exportFailed(error.localizedDescription)))
             return
         }
 
-        let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let out = dir.appendingPathComponent("synced_\(Int(offsetMs))ms.mp4")
+        run(composition: composition,
+            out: outputURL(source: source, offsetMs: offsetMs),
+            presets: presets,
+            progress: progress,
+            completion: completion)
+    }
+
+    private static func run(composition: AVComposition,
+                            out: URL,
+                            presets: [String],
+                            progress: @escaping (Double) -> Void,
+                            completion: @escaping (Result<URL, Error>) -> Void) {
+        guard let preset = presets.first else {
+            completion(.failure(CompensateError.exportFailed("没有可用的导出格式")))
+            return
+        }
         try? FileManager.default.removeItem(at: out)
 
-        guard let exporter = AVAssetExportSession(asset: composition,
-                                                  presetName: AVAssetExportPresetHighestQuality) else {
-            completion(.failure(CompensateError.exportFailed("无法创建导出会话")))
+        guard let exporter = AVAssetExportSession(asset: composition, presetName: preset) else {
+            run(composition: composition, out: out, presets: Array(presets.dropFirst()),
+                progress: progress, completion: completion)
             return
         }
         exporter.outputURL = out
         exporter.outputFileType = .mp4
         exporter.shouldOptimizeForNetworkUse = true
+        current = exporter
+
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { _ in
+            progress(Double(exporter.progress))
+        }
+        if let timer { RunLoop.main.add(timer, forMode: .common) }
 
         exporter.exportAsynchronously {
             DispatchQueue.main.async {
+                CompensateExporter.timer?.invalidate()
+                CompensateExporter.timer = nil
+                CompensateExporter.current = nil
+
                 switch exporter.status {
                 case .completed:
+                    progress(1)
                     completion(.success(out))
+                case .cancelled:
+                    try? FileManager.default.removeItem(at: out)
+                    completion(.failure(CompensateError.exportFailed("已取消")))
                 default:
-                    completion(.failure(CompensateError.exportFailed(
-                        exporter.error?.localizedDescription ?? "未知错误")))
+                    let rest = Array(presets.dropFirst())
+                    if rest.isEmpty {
+                        completion(.failure(CompensateError.exportFailed(
+                            exporter.error?.localizedDescription ?? "未知错误")))
+                    } else {
+                        run(composition: composition, out: out, presets: rest,
+                            progress: progress, completion: completion)
+                    }
                 }
             }
         }
@@ -562,14 +805,33 @@ final class CompensateViewController: UIViewController {
     private let valueLabel = UILabel()
     private let statusLabel = UILabel()
     private let slider = UISlider()
+    private let progressBar = UIProgressView(progressViewStyle: .default)
 
     private var source: URL?
+    private var sourceSize: Int64 = 0
     private var offsetMs: Double = 120
+    private var exporting = false
+    private var startedAt: Date?
+    private var bgTask: UIBackgroundTaskIdentifier = .invalid
+    private var actionButton: UIButton?
+    private var lastExport: URL?
+
+    private lazy var shareButton: UIButton = {
+        var config = UIButton.Configuration.tinted()
+        config.title = "分享这份文件"
+        config.cornerStyle = .medium
+        let button = UIButton(configuration: config)
+        button.addAction(UIAction { [weak self] _ in self?.presentShare() }, for: .touchUpInside)
+        return button
+    }()
 
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "补偿版导出"
-        view.backgroundColor = .systemBackground
+        view.backgroundColor = .systemGroupedBackground
+        if let saved = UserDefaults.standard.object(forKey: "exportOffsetMs") as? Double {
+            offsetMs = saved
+        }
         buildUI()
     }
 
@@ -579,11 +841,11 @@ final class CompensateViewController: UIViewController {
         help.font = .systemFont(ofSize: 13)
         help.textColor = .secondaryLabel
         help.text = """
-        先判断方向：
-        · 看到手拍下去，才听到啪 → 声音偏晚，用负值
-        · 先听到啪，才看到手拍下去 → 声音偏早，用正值
+        判断方向：
+        · 先听到声、后看到动作 → 声音偏早，用正值（音频后移）
+        · 先看到动作、后听到声 → 声音偏晚，用负值（画面后移）
 
-        导出后文件在「文件」App → 我的 iPhone → CarPlayCast。
+        导出后用 CarMovie 打开那份新文件即可。
         """
 
         valueLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
@@ -594,23 +856,44 @@ final class CompensateViewController: UIViewController {
         slider.value = Float(offsetMs)
         slider.addTarget(self, action: #selector(sliderChanged), for: .valueChanged)
 
+        progressBar.progress = 0
+        progressBar.isHidden = true
+
         statusLabel.font = .systemFont(ofSize: 13)
         statusLabel.textColor = .secondaryLabel
         statusLabel.numberOfLines = 0
 
+        let exportButton = makeButton("导出补偿版", #selector(runExport))
+        actionButton = exportButton
+
         stack.axis = .vertical
-        stack.spacing = 16
+        stack.spacing = 14
         stack.translatesAutoresizingMaskIntoConstraints = false
-        [help, valueLabel, slider,
+        stack.isLayoutMarginsRelativeArrangement = true
+        stack.layoutMargins = UIEdgeInsets(top: 0, left: 20, bottom: 20, right: 20)
+
+        let presetRow = UIStackView(arrangedSubviews: [
+            makePresetButton("−100", -100),
+            makePresetButton("0", 0),
+            makePresetButton("+100", 100),
+            makePresetButton("+150", 150),
+            makePresetButton("+200", 200)
+        ])
+        presetRow.axis = .horizontal
+        presetRow.distribution = .fillEqually
+        presetRow.spacing = 6
+
+        shareButton.isHidden = true
+
+        [help, valueLabel, slider, presetRow,
          makeButton("选择视频", #selector(pickVideo)),
-         makeButton("导出补偿版", #selector(runExport)),
-         statusLabel].forEach { stack.addArrangedSubview($0) }
+         exportButton, progressBar, statusLabel, shareButton].forEach { stack.addArrangedSubview($0) }
         view.addSubview(stack)
 
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
-            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 20)
+            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         ])
 
         refresh()
@@ -625,6 +908,11 @@ final class CompensateViewController: UIViewController {
         return b
     }
 
+    private func setActionTitle(_ title: String) {
+        actionButton?.configuration?.title = title
+        actionButton?.setTitle(title, for: .normal)
+    }
+
     private func refresh() {
         let direction = offsetMs > 0 ? "音频后移" : (offsetMs < 0 ? "画面后移" : "不偏移")
         valueLabel.text = String(format: "%+.0f ms · %@", offsetMs, direction)
@@ -633,6 +921,7 @@ final class CompensateViewController: UIViewController {
     @objc private func sliderChanged() {
         offsetMs = Double(slider.value).rounded()
         refresh()
+        UserDefaults.standard.set(offsetMs, forKey: "exportOffsetMs")
     }
 
     @objc private func pickVideo() {
@@ -642,6 +931,10 @@ final class CompensateViewController: UIViewController {
     }
 
     @objc private func runExport() {
+        if exporting {
+            CompensateExporter.cancel()
+            return
+        }
         guard let source else {
             statusLabel.text = "先选一个视频"
             return
@@ -651,14 +944,114 @@ final class CompensateViewController: UIViewController {
             return
         }
 
-        statusLabel.text = "导出中…长视频要等一会儿"
-        CompensateExporter.export(source: source, offsetMs: offsetMs) { [weak self] result in
+        let needed = sourceSize == 0 ? 0 : Int64(Double(sourceSize) * 1.2)
+        let free = CompensateExporter.freeSpace()
+        if free > 0 && free < needed {
+            statusLabel.text = "空间不足：需要约 \(Format.bytes(needed))，可用 \(Format.bytes(free))"
+            return
+        }
+
+        UserDefaults.standard.set(offsetMs, forKey: "exportOffsetMs")
+
+        if batteryTooLow() {
+            let alert = UIAlertController(title: "电量低于 20%",
+                                          message: "导出比较耗电，建议先接电源。现在继续吗？",
+                                          preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "先不导", style: .cancel))
+            alert.addAction(UIAlertAction(title: "继续", style: .default) { [weak self] _ in
+                self?.startExport(source: source)
+            })
+            present(alert, animated: true)
+            return
+        }
+
+        startExport(source: source)
+    }
+
+    private func startExport(source: URL) {
+        exporting = true
+        startedAt = Date()
+        shareButton.isHidden = true
+        progressBar.isHidden = false
+        progressBar.progress = 0
+        setActionTitle("取消")
+        statusLabel.text = "准备中…"
+
+        UIApplication.shared.isIdleTimerDisabled = true
+        bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in
+            self?.endBackground()
+        }
+
+        CompensateExporter.export(source: source, offsetMs: offsetMs, progress: { [weak self] p in
+            self?.updateProgress(p)
+        }, completion: { [weak self] result in
+            guard let self else { return }
+            self.exporting = false
+            self.setActionTitle("导出补偿版")
+            self.progressBar.isHidden = true
+            UIApplication.shared.isIdleTimerDisabled = false
+            self.endBackground()
+
             switch result {
             case .success(let url):
-                self?.statusLabel.text = "完成：\(url.lastPathComponent)\n位置：文件 App → CarPlayCast"
+                self.lastExport = url
+                self.shareButton.isHidden = false
+                let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+                self.statusLabel.text = "完成 · \(Format.bytes(size))\n\(url.lastPathComponent)\n位置：文件 App → CarPlayCast"
             case .failure(let error):
-                self?.statusLabel.text = error.localizedDescription
+                self.statusLabel.text = error.localizedDescription
             }
+        })
+    }
+
+    private func makePresetButton(_ title: String, _ value: Double) -> UIButton {
+        let button = UIButton(type: .system)
+        button.setTitle(title, for: .normal)
+        button.titleLabel?.font = .systemFont(ofSize: 13, weight: .medium)
+        button.addAction(UIAction { [weak self] _ in self?.applyPreset(value) }, for: .touchUpInside)
+        return button
+    }
+
+    private func applyPreset(_ value: Double) {
+        offsetMs = value
+        slider.value = Float(value)
+        refresh()
+        UserDefaults.standard.set(value, forKey: "exportOffsetMs")
+    }
+
+    private func presentShare() {
+        guard let lastExport else { return }
+        let controller = UIActivityViewController(activityItems: [lastExport], applicationActivities: nil)
+        controller.popoverPresentationController?.sourceView = shareButton
+        present(controller, animated: true)
+    }
+
+    private func batteryTooLow() -> Bool {
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        let level = UIDevice.current.batteryLevel
+        guard level >= 0 else { return false }
+        return level < 0.2 && UIDevice.current.batteryState != .charging
+    }
+
+    private func updateProgress(_ p: Double) {
+        let value = min(max(p, 0), 1)
+        progressBar.setProgress(Float(value), animated: true)
+
+        var text = "\(Int(value * 100))%"
+        if value > 0.03, let startedAt {
+            let elapsed = Date().timeIntervalSince(startedAt)
+            let total = elapsed / value
+            text += " · 预计还需 " + Format.duration(max(0, total - elapsed))
+        } else {
+            text += " · 估算中…"
+        }
+        statusLabel.text = text
+    }
+
+    private func endBackground() {
+        if bgTask != .invalid {
+            UIApplication.shared.endBackgroundTask(bgTask)
+            bgTask = .invalid
         }
     }
 }
@@ -671,6 +1064,143 @@ extension CompensateViewController: UIDocumentPickerDelegate {
         try? FileManager.default.removeItem(at: dst)
         try? FileManager.default.copyItem(at: url, to: dst)
         source = dst
-        statusLabel.text = "已选择：\(url.lastPathComponent)"
+
+        let size = Int64((try? dst.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        sourceSize = size
+        statusLabel.text = "已选择：\(url.lastPathComponent) · \(Format.bytes(size))"
+    }
+}
+
+// MARK: - 已导出文件
+
+final class ExportedFilesViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
+
+    private let table = UITableView(frame: .zero, style: .insetGrouped)
+    private var files: [URL] = []
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "已导出"
+        view.backgroundColor = .systemGroupedBackground
+
+        table.dataSource = self
+        table.delegate = self
+        table.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
+        table.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(table)
+
+        NSLayoutConstraint.activate([
+            table.topAnchor.constraint(equalTo: view.topAnchor),
+            table.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            table.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            table.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        reload()
+    }
+
+    private func reload() {
+        let dir = CompensateExporter.documentsDir()
+        let urls = (try? FileManager.default.contentsOfDirectory(at: dir,
+                                                                 includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey])) ?? []
+        files = urls.filter { $0.pathExtension.lowercased() == "mp4" }
+            .sorted { a, b in
+                let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return da > db
+            }
+        table.reloadData()
+    }
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        files.count
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "cell", for: indexPath)
+        let url = files[indexPath.row]
+        var content = cell.defaultContentConfiguration()
+        content.text = url.lastPathComponent
+        let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        content.secondaryText = Format.bytes(size)
+        cell.contentConfiguration = content
+        cell.accessoryType = .disclosureIndicator
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        let url = files[indexPath.row]
+        let share = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        share.popoverPresentationController?.sourceView = tableView
+        share.popoverPresentationController?.sourceRect = tableView.rectForRow(at: indexPath)
+        present(share, animated: true)
+    }
+
+    func tableView(_ tableView: UITableView,
+                   trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        let delete = UIContextualAction(style: .destructive, title: "删除") { [weak self] _, _, done in
+            guard let self else { return done(false) }
+            try? FileManager.default.removeItem(at: self.files[indexPath.row])
+            self.reload()
+            done(true)
+        }
+        return UISwipeActionsConfiguration(actions: [delete])
+    }
+
+    override func setEditing(_ editing: Bool, animated: Bool) {
+        super.setEditing(editing, animated: animated)
+        table.setEditing(editing, animated: animated)
+    }
+}
+
+// MARK: - 说明
+
+final class AboutViewController: UIViewController {
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "说明"
+        view.backgroundColor = .systemGroupedBackground
+
+        let text = UITextView()
+        text.isEditable = false
+        text.backgroundColor = .clear
+        text.font = .systemFont(ofSize: 15)
+        text.textContainerInset = UIEdgeInsets(top: 16, left: 16, bottom: 32, right: 16)
+        text.translatesAutoresizingMaskIntoConstraints = false
+        text.text = """
+        三种模式
+
+        1. 车载播放
+        车机主屏的列表，播的是 440Hz 测试音。它证明 CarPlay 通道是通的。
+
+        2. 视频同步（画面在手机，声音走车机）
+        视频在手机上放，声音从车里出。因为声音要过 CarPlay 管道，会比画面晚 80~200ms，
+        所以让画面延后同样的时间。滑杆 0~600ms，拖到「听到的啪」和「看到的啪」重合。
+        播放时每 2 秒比对一次时间轴，偏差超过 120ms 自动纠偏。
+
+        3. 补偿版导出（给 CarMovie 这类车机播放器用）
+        它们内部时序改不了，就把补偿做进文件：导出一份新 MP4，
+        音频整体平移 X 毫秒。用 CarMovie 打开新文件，音画就是齐的。
+
+        边界
+
+        · CarPlay 没有公开的视频通道，第三方 App 在车机上放视频只能靠私有接口
+        · 补偿值是每台车一个常数，换车、换有线/无线都要重调
+        · 导出期间要留在前台，iOS 只给约 30 秒后台时间
+        · 流媒体链接（m3u8）没法预先补偿，只能处理本地文件
+        """
+        view.addSubview(text)
+
+        NSLayoutConstraint.activate([
+            text.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            text.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            text.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            text.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
     }
 }
