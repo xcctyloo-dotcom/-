@@ -2,14 +2,21 @@ name: build-ipa
 on: workflow_dispatch
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
-      - run: brew install xcodegen ldid
+      - run: brew install xcodegen ldid || brew install xcodegen
       - run: xcodegen generate
       - run: xcodebuild -project CarPlayCast.xcodeproj -target CarPlayCast -configuration Release -sdk iphoneos CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO SYMROOT=$PWD/build/sym build
-      - run: ldid -S"CarPlayCast.entitlements" build/sym/Release-iphoneos/CarPlayCast.app/CarPlayCast
-      - run: mkdir -p build/Payload && cp -R build/sym/Release-iphoneos/CarPlayCast.app build/Payload/ && rm -rf build/Payload/CarPlayCast.app/_CodeSignature && cd build && zip -qry CarPlayCast.ipa Payload
+      - run: |
+          APP=build/sym/Release-iphoneos/CarPlayCast.app
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S"CarPlayCast.entitlements" "$APP/CarPlayCast"
+          else
+            codesign -f -s - --entitlements CarPlayCast.entitlements "$APP"
+          fi
+          codesign -d --entitlements - "$APP" || true
+      - run: mkdir -p build/Payload && cp -R build/sym/Release-iphoneos/CarPlayCast.app build/Payload/ && cd build && zip -qry CarPlayCast.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
           name: CarPlayCast-ipa
