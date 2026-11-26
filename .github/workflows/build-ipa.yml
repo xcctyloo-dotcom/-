@@ -7,8 +7,21 @@ jobs:
       - uses: actions/checkout@v4
       - run: brew install xcodegen ldid || brew install xcodegen
       - run: xcodegen generate
-      - run: xcodebuild -project CarPlayCast.xcodeproj -target CarPlayCast -configuration Release -sdk iphoneos CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO SYMROOT=$PWD/build/sym build
-      - run: |
+      - name: Build
+        run: |
+          set +e
+          xcodebuild -project CarPlayCast.xcodeproj -target CarPlayCast \
+            -configuration Release -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            SYMROOT="$PWD/build/sym" build > build.log 2>&1
+          status=$?
+          echo "===== ERRORS ====="
+          grep -n "error:" build.log | head -60
+          echo "===== TAIL ===="
+          tail -20 build.log
+          exit $status
+      - name: Sign
+        run: |
           APP=build/sym/Release-iphoneos/CarPlayCast.app
           if command -v ldid >/dev/null 2>&1; then
             ldid -S"CarPlayCast.entitlements" "$APP/CarPlayCast"
@@ -16,7 +29,11 @@ jobs:
             codesign -f -s - --entitlements CarPlayCast.entitlements "$APP"
           fi
           codesign -d --entitlements - "$APP" || true
-      - run: mkdir -p build/Payload && cp -R build/sym/Release-iphoneos/CarPlayCast.app build/Payload/ && cd build && zip -qry CarPlayCast.ipa Payload
+      - name: Package
+        run: |
+          mkdir -p build/Payload
+          cp -R build/sym/Release-iphoneos/CarPlayCast.app build/Payload/
+          cd build && zip -qry CarPlayCast.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
           name: CarPlayCast-ipa
