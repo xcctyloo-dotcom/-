@@ -1228,7 +1228,7 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         selecting.toggle()
         table.setEditing(selecting, animated: true)
         navigationItem.rightBarButtonItem?.title = selecting ? "完成" : "选择"
-        if !selecting { table.deselectAll(animated: false) }
+        if !selecting { clearSelection() }
         table.reloadData()
         updateBar()
     }
@@ -1237,11 +1237,18 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         guard selecting else { return }
         let allSelected = (table.indexPathsForSelectedRows?.count ?? 0) == files.count
         if allSelected {
-            table.deselectAll(animated: false)
+            clearSelection()
         } else {
             for row in files.indices {
                 table.selectRow(at: IndexPath(row: row, section: 0), animated: false, scrollPosition: .none)
             }
+        }
+        updateBar()
+    }
+
+    private func clearSelection() {
+        (table.indexPathsForSelectedRows ?? []).forEach {
+            table.deselectRow(at: $0, animated: false)
         }
         updateBar()
     }
