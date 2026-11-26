@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "2.0"
-    static let note = "playlist"
+    static let version = "2.1"
+    static let note = "fixed-port"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -709,8 +709,7 @@ enum CompensateExporter {
     static func outputURL(source: URL, offsetMs: Double) -> URL {
         let base = source.deletingPathExtension().lastPathComponent
         let sign = offsetMs >= 0 ? "p" : "m"
-        let stamp = Int(Date().timeIntervalSince1970)
-        return documentsDir().appendingPathComponent("\(base)_\(sign)\(Int(abs(offsetMs)))ms_\(stamp).mp4")
+        return documentsDir().appendingPathComponent("\(base)_\(sign)\(Int(abs(offsetMs)))ms.mp4")
     }
 
     /// offsetMs > 0：音频后移；offsetMs < 0：画面后移
@@ -1889,16 +1888,20 @@ final class LocalFileServer {
             completion(port)
             return
         }
+        Log.write("server: start requested \(BuildInfo.display)")
+        // 端口写死，链接就能长期有效；被占用就顺延
+        attempt(ports: [8080, 8081, 8082, 8083, 8084, 8085], completion: completion)
+    }
 
-        Log.write("server: creating listener")
+    private func attempt(ports: [UInt16], completion: @escaping (UInt16) -> Void) {
+        let candidate = ports.first ?? 0
+        let rest = Array(ports.dropFirst())
+
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
 
-        // 注意：不能给“监听器”设 requiredLocalEndpoint，会直接崩溃。
-        // 只接受本机连接，靠下面的 isLoopback 过滤。
-        guard let listener = try? NWListener(using: params, on: .any) else {
-            Log.write("server: listener create failed")
-            DispatchQueue.main.async { completion(0) }
+        guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: candidate)!) else {
+            if rest.isEmpty { failOut(completion) } else { attempt(ports: rest, completion: completion) }
             return
         }
 
@@ -1915,15 +1918,23 @@ final class LocalFileServer {
                 guard !reported else { return }
                 reported = true
                 let value = self.port
-                // 回调一律切回主线程，UI 只能在主线程动
                 DispatchQueue.main.async { completion(value) }
-            case .failed, .cancelled:
-                Log.write("server: state \(state)")
-                self.listener = nil
-                self.port = 0
+            case .failed(let error):
+                Log.write("server: port \(candidate) failed \(error)")
                 guard !reported else { return }
                 reported = true
-                DispatchQueue.main.async { completion(0) }
+                listener.cancel()
+                DispatchQueue.main.async {
+                    if rest.isEmpty {
+                        self.failOut(completion)
+                    } else {
+                        self.attempt(ports: rest, completion: completion)
+                    }
+                }
+            case .cancelled:
+                guard !reported else { return }
+                reported = true
+                DispatchQueue.main.async { self.failOut(completion) }
             default:
                 break
             }
@@ -1931,6 +1942,13 @@ final class LocalFileServer {
 
         self.listener = listener
         listener.start(queue: .global(qos: .userInitiated))
+    }
+
+    private func failOut(_ completion: @escaping (UInt16) -> Void) {
+        Log.write("server: no port available")
+        listener = nil
+        port = 0
+        DispatchQueue.main.async { completion(0) }
     }
 
     func stop() {
