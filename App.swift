@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "2.7"
-    static let note = "stability"
+    static let version = "2.8"
+    static let note = "sample-dedup"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -1081,6 +1081,7 @@ final class CompensateViewController: UIViewController {
         }
 
         let url = sources[currentIndex]
+        let startedAt = Date()
         CompensateExporter.export(source: url, offsetMs: offsetMs, progress: { [weak self] p in
             guard let self else { return }
             let overall = (Double(self.completed + self.failed) + p) / Double(max(1, self.sources.count))
@@ -1098,6 +1099,9 @@ final class CompensateViewController: UIViewController {
                 self.completed += 1
                 self.lastExport = output
                 self.outputs.append(output)
+                let seconds = Int(Date().timeIntervalSince(startedAt))
+                let mbps = VideoInfo.load(url).map { String(format: "%.1fMbps", $0.megabitsPerSecond) } ?? "?"
+                Log.write("export ok \(url.lastPathComponent) \(mbps) \(seconds)s")
             case .failure(let error):
                 self.failed += 1
                 Log.write("export failed \(url.lastPathComponent): \(error.localizedDescription)")
@@ -1120,8 +1124,10 @@ final class CompensateViewController: UIViewController {
         if sources.count == 1 {
             OffsetStore.saveOffset(offsetMs, forSize: sourceSizes.first ?? 0)
             refreshLearnLabel()
-            if let info = sources.first.flatMap({ VideoInfo.load($0) }) {
-                OffsetStore.recordSample(mbps: info.megabitsPerSecond, offset: offsetMs)
+            if let first = sources.first, let info = VideoInfo.load(first) {
+                OffsetStore.recordSample(size: sourceSizes.first ?? 0,
+                                         mbps: info.megabitsPerSecond,
+                                         offset: offsetMs)
             }
         }
 
@@ -1506,12 +1512,41 @@ enum OffsetStore {
 
     private static let samplesKey = "offsetSamples"
 
-    static func recordSample(mbps: Double, offset: Double) {
-        guard mbps > 0 else { return }
-        var array = UserDefaults.standard.array(forKey: samplesKey) as? [[String: Any]] ?? []
-        array.append(["m": mbps, "o": offset])
-        if array.count > 200 { array.removeFirst(array.count - 200) }
-        UserDefaults.standard.set(array, forKey: samplesKey)
+    private static func rawMap() -> [String: Any] {
+        UserDefaults.standard.dictionary(forKey: samplesKey) ?? [:]
+    }
+
+    /// (码率 Mbps, 偏移 ms) 样本列表；同一部片子只保留最后一次
+    private static func samples() -> [(Double, Double)] {
+        rawMap().values.compactMap { value in
+            guard let dict = value as? [String: Any],
+                  let mbps = dict["m"] as? Double,
+                  let offset = dict["o"] as? Double else { return nil }
+            return (mbps, offset)
+        }
+    }
+
+    /// 用文件体积做指纹：反复试调同一部片子，只留最后一次
+    static func recordSample(size: Int64, mbps: Double, offset: Double) {
+        guard mbps > 0, size > 0 else { return }
+        var map = rawMap()
+        map["\(size)"] = [
+            "m": mbps,
+            "o": offset,
+            "t": Date().timeIntervalSince1970
+        ]
+
+        if map.count > 120 {
+            let sorted = map.sorted {
+                let l = (($0.value as? [String: Any])?["t"] as? Double) ?? 0
+                let r = (($1.value as? [String: Any])?["t"] as? Double) ?? 0
+                return l < r
+            }
+            for (key, _) in sorted.prefix(map.count - 120) {
+                map.removeValue(forKey: key)
+            }
+        }
+        UserDefaults.standard.set(map, forKey: samplesKey)
     }
 
     struct Fit {
@@ -1520,17 +1555,11 @@ enum OffsetStore {
         let count: Int
     }
 
-    static var sampleCount: Int {
-        (UserDefaults.standard.array(forKey: samplesKey) as? [[String: Any]] ?? []).count
-    }
+    static var sampleCount: Int { rawMap().count }
 
     /// 最小二乘：偏移 ≈ slope × 码率 + intercept
     static func fit() -> Fit? {
-        let array = UserDefaults.standard.array(forKey: samplesKey) as? [[String: Any]] ?? []
-        let points: [(Double, Double)] = array.compactMap {
-            guard let m = $0["m"] as? Double, let o = $0["o"] as? Double else { return nil }
-            return (m, o)
-        }
+        let points = samples()
         guard points.count >= 3 else { return nil }
 
         let xs = points.map { $0.0 }
@@ -1559,14 +1588,11 @@ enum OffsetStore {
     /// 按码率相近的历史样本推测偏移
     static func suggestion(forMbps mbps: Double) -> Double? {
         guard mbps > 0 else { return nil }
-        let array = UserDefaults.standard.array(forKey: samplesKey) as? [[String: Any]] ?? []
         let tolerance = max(1.0, mbps * 0.4)
-        let values = array.compactMap { sample -> Double? in
-            guard let m = sample["m"] as? Double,
-                  let o = sample["o"] as? Double,
-                  abs(m - mbps) <= tolerance else { return nil }
-            return o
+        let values = samples().compactMap { sample -> Double? in
+            abs(sample.0 - mbps) <= tolerance ? sample.1 : nil
         }.sorted()
+
         if values.count >= 2 {
             return values[values.count / 2]
         }
