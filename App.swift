@@ -1880,16 +1880,19 @@ final class LocalFileServer {
             return
         }
 
+        Log.write("server: creating listener")
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
 
         // 注意：不能给“监听器”设 requiredLocalEndpoint，会直接崩溃。
         // 只接受本机连接，靠下面的 isLoopback 过滤。
         guard let listener = try? NWListener(using: params, on: .any) else {
-            completion(0)
+            Log.write("server: listener create failed")
+            DispatchQueue.main.async { completion(0) }
             return
         }
 
+        var reported = false
         listener.newConnectionHandler = { [weak self] connection in
             self?.accept(connection)
         }
@@ -1898,10 +1901,19 @@ final class LocalFileServer {
             switch state {
             case .ready:
                 self.port = listener.port?.rawValue ?? 0
-                completion(self.port)
+                Log.write("server: ready on \(self.port)")
+                guard !reported else { return }
+                reported = true
+                let value = self.port
+                // 回调一律切回主线程，UI 只能在主线程动
+                DispatchQueue.main.async { completion(value) }
             case .failed, .cancelled:
+                Log.write("server: state \(state)")
                 self.listener = nil
                 self.port = 0
+                guard !reported else { return }
+                reported = true
+                DispatchQueue.main.async { completion(0) }
             default:
                 break
             }
@@ -2186,11 +2198,14 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource {
             return
         }
 
+        Log.write("server: toggle tapped, running=\(LocalFileServer.shared.isRunning)")
         LocalFileServer.shared.start { [weak self] port in
-            guard let self else { return }
-            self.baseURL = port == 0 ? "启动失败" : "http://127.0.0.1:\(port)"
-            self.updateButton()
-            self.table.reloadData()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.baseURL = port == 0 ? "启动失败" : "http://127.0.0.1:\(port)"
+                self.updateButton()
+                self.table.reloadData()
+            }
         }
     }
 
