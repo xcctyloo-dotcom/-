@@ -1782,8 +1782,11 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
             var copied: URL?
             if let url {
                 let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
+                let formatter = DateFormatter()
+                formatter.dateFormat = "MMdd_HHmmss"
+                let stamp = formatter.string(from: Date())
                 let dst = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(UUID().uuidString + "." + ext)
+                    .appendingPathComponent("相机_\(stamp)_\(index + 1).\(ext)")
                 try? FileManager.default.removeItem(at: dst)
                 if (try? FileManager.default.copyItem(at: url, to: dst)) != nil {
                     copied = dst
