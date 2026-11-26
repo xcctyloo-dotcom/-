@@ -32,6 +32,8 @@
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
 	</array>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>测量车机音频延迟时需要短暂录音。录音只在本机分析，不上传、不保存。</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>

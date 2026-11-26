@@ -351,8 +351,8 @@ final class VideoSyncViewController: UIViewController {
     private var isSeeking = false
 
     private var offsetMs: Double {
-        get { UserDefaults.standard.double(forKey: "syncOffsetMs") }
-        set { UserDefaults.standard.set(newValue, forKey: "syncOffsetMs") }
+        get { OffsetStore.current }
+        set { OffsetStore.current = newValue }
     }
 
     override func viewDidLoad() {
@@ -809,7 +809,7 @@ final class CompensateViewController: UIViewController {
 
     private var sources: [URL] = []
     private var sourceSizes: [Int64] = []
-    private var offsetMs: Double = 120
+    private var offsetMs: Double = OffsetStore.current
     private var exporting = false
     private var cancelling = false
     private var startedAt: Date?
@@ -833,9 +833,6 @@ final class CompensateViewController: UIViewController {
         super.viewDidLoad()
         title = "补偿版导出"
         view.backgroundColor = .systemGroupedBackground
-        if let saved = UserDefaults.standard.object(forKey: "exportOffsetMs") as? Double {
-            offsetMs = saved
-        }
         buildUI()
     }
 
@@ -892,6 +889,7 @@ final class CompensateViewController: UIViewController {
         stack.layoutMargins = UIEdgeInsets(top: 0, left: 20, bottom: 20, right: 20)
 
         [help, valueLabel, slider, presetRow,
+         makeButton("自动测量延迟", #selector(measureTapped)),
          makeButton("选择视频（可多选）", #selector(pickVideo)),
          exportButton, progressBar, statusLabel, shareButton].forEach { stack.addArrangedSubview($0) }
         view.addSubview(stack)
@@ -939,14 +937,14 @@ final class CompensateViewController: UIViewController {
     @objc private func sliderChanged() {
         offsetMs = Double(slider.value).rounded()
         refresh()
-        UserDefaults.standard.set(offsetMs, forKey: "exportOffsetMs")
+        OffsetStore.current = offsetMs
     }
 
     private func applyPreset(_ value: Double) {
         offsetMs = value
         slider.value = Float(value)
         refresh()
-        UserDefaults.standard.set(value, forKey: "exportOffsetMs")
+        OffsetStore.current = value
     }
 
     // MARK: 选视频
@@ -984,7 +982,7 @@ final class CompensateViewController: UIViewController {
             return
         }
 
-        UserDefaults.standard.set(offsetMs, forKey: "exportOffsetMs")
+        OffsetStore.current = offsetMs
 
         if batteryTooLow() {
             let alert = UIAlertController(title: "电量低于 20%",
@@ -1046,8 +1044,9 @@ final class CompensateViewController: UIViewController {
             case .success(let output):
                 self.completed += 1
                 self.lastExport = output
-            case .failure:
+            case .failure(let error):
                 self.failed += 1
+                Log.write("export failed \(url.lastPathComponent): \(error.localizedDescription)")
             }
 
             self.currentIndex += 1
@@ -1395,5 +1394,304 @@ final class AboutViewController: UIViewController {
             text.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             text.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
+    }
+}
+
+// MARK: - 偏移存储（按车记忆）
+
+/// 每台车、每种连接单独存一个偏移。CarPlay 的音频输出端口名就是车机名。
+enum OffsetStore {
+
+    private static let mapKey = "offsetByRoute"
+    private static let lastKey = "lastOffsetMs"
+
+    static var routeName: String {
+        let name = AVAudioSession.sharedInstance().currentRoute.outputs.first?.portName
+        if let name, !name.isEmpty { return name }
+        return "手机"
+    }
+
+    static var isCarPlay: Bool {
+        AVAudioSession.sharedInstance().currentRoute.outputs.contains {
+            $0.portType == .carAudio
+        }
+    }
+
+    static var current: Double {
+        get {
+            let map = UserDefaults.standard.dictionary(forKey: mapKey) ?? [:]
+            if let value = map[routeName] as? Double { return value }
+            if let last = UserDefaults.standard.object(forKey: lastKey) as? Double { return last }
+            return 120
+        }
+        set {
+            var map = UserDefaults.standard.dictionary(forKey: mapKey) ?? [:]
+            map[routeName] = newValue
+            UserDefaults.standard.set(map, forKey: mapKey)
+            UserDefaults.standard.set(newValue, forKey: lastKey)
+        }
+    }
+
+    static var summary: String {
+        let map = UserDefaults.standard.dictionary(forKey: mapKey) ?? [:]
+        guard !map.isEmpty else { return "还没有保存过任何车的偏移" }
+        return map.map { "\($0.key)：\(Int(($0.value as? Double) ?? 0)) ms" }
+            .sorted()
+            .joined(separator: "\n")
+    }
+}
+
+// MARK: - 日志
+
+enum Log {
+
+    static func fileURL() -> URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("debug.log")
+    }
+
+    static func write(_ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM-dd HH:mm:ss"
+        let line = "[\(formatter.string(from: Date()))] \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+
+        let url = fileURL()
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+}
+
+// MARK: - 测量用的咔哒声
+
+enum ClickFile {
+
+    static func url() -> URL? {
+        let dst = FileManager.default.temporaryDirectory.appendingPathComponent("click.wav")
+        if FileManager.default.fileExists(atPath: dst.path) { return dst }
+
+        let sampleRate = 44100
+        let count = sampleRate / 20          // 50ms
+        let dataLen = count * 2
+        var data = Data()
+
+        func put<T: FixedWidthInteger>(_ v: T) {
+            var x = v.littleEndian
+            withUnsafeBytes(of: &x) { data.append(contentsOf: $0) }
+        }
+        func putAscii(_ s: String) { data.append(contentsOf: Array(s.utf8)) }
+
+        putAscii("RIFF"); put(UInt32(36 + dataLen)); putAscii("WAVE")
+        putAscii("fmt "); put(UInt32(16)); put(UInt16(1)); put(UInt16(1))
+        put(UInt32(sampleRate)); put(UInt32(sampleRate * 2))
+        put(UInt16(2)); put(UInt16(16))
+        putAscii("data"); put(UInt32(dataLen))
+
+        for i in 0..<count {
+            let t = Double(i) / Double(sampleRate)
+            let decay = exp(-t * 60)
+            let value = sin(2 * .pi * 1000 * t) * decay * 0.9
+            put(Int16(max(-32767, min(32767, value * 32767))))
+        }
+
+        do {
+            try data.write(to: dst)
+            return dst
+        } catch {
+            return nil
+        }
+    }
+}
+
+// MARK: - 波形分析
+
+enum AudioAnalysis {
+
+    /// 返回录音里第一次超过阈值的时间点（秒）
+    static func firstOnset(fileURL: URL) -> Double? {
+        guard let file = try? AVAudioFile(forReading: fileURL) else { return nil }
+        let format = file.processingFormat
+        let frames = AVAudioFrameCount(file.length)
+        guard frames > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
+        guard (try? file.read(into: buffer)) != nil,
+              let channel = buffer.floatChannelData?[0] else { return nil }
+
+        let count = Int(buffer.frameLength)
+        var run = 0
+        for i in 0..<count {
+            if abs(channel[i]) > 0.06 {
+                run += 1
+                if run >= 3 {
+                    return Double(i - 2) / format.sampleRate
+                }
+            } else {
+                run = 0
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - 自动测量
+
+final class Calibrator {
+
+    static let shared = Calibrator()
+
+    enum MeasureError: LocalizedError {
+        case noPermission
+        case busy
+        case noSignal
+        case outOfRange(Double)
+
+        var errorDescription: String? {
+            switch self {
+            case .noPermission: return "没有麦克风权限，去设置里允许"
+            case .busy: return "录音启动失败，可能被别的 App 占用"
+            case .noSignal: return "没听到咔哒声，检查车机音量或换个安静环境"
+            case .outOfRange(let ms): return String(format: "测到 %.0f ms，明显不对，建议手动调", ms)
+            }
+        }
+    }
+
+    private var recorder: AVAudioRecorder?
+    private var player: AVAudioPlayer?
+    private var startedAt: Date?
+    private var clickAt: Date?
+    private var completion: ((Result<Double, Error>) -> Void)?
+
+    private init() {}
+
+    func measure(completion: @escaping (Result<Double, Error>) -> Void) {
+        guard recorder == nil else {
+            completion(.failure(MeasureError.busy))
+            return
+        }
+        self.completion = completion
+
+        AVAudioSession.sharedInstance().requestRecordPermission { [weak self] granted in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard granted else {
+                    self.finish(.failure(MeasureError.noPermission))
+                    return
+                }
+                self.start()
+            }
+        }
+    }
+
+    private func start() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playAndRecord, mode: .default,
+                                    options: [.defaultToSpeaker, .allowBluetoothA2DP])
+            try session.setActive(true)
+        } catch {
+            finish(.failure(error))
+            return
+        }
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cal.m4a")
+        try? FileManager.default.removeItem(at: url)
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 44100.0,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+        ]
+
+        guard let recorder = try? AVAudioRecorder(url: url, settings: settings) else {
+            finish(.failure(MeasureError.busy))
+            return
+        }
+        self.recorder = recorder
+        guard recorder.record() else {
+            finish(.failure(MeasureError.busy))
+            return
+        }
+
+        startedAt = Date()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
+            self.clickAt = Date()
+            if let clickURL = ClickFile.url() {
+                self.player = try? AVAudioPlayer(contentsOf: clickURL)
+                self.player?.play()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.stopAndAnalyze()
+            }
+        }
+    }
+
+    private func stopAndAnalyze() {
+        let url = recorder?.url
+        recorder?.stop()
+        recorder = nil
+
+        guard let url,
+              let clickAt,
+              let startedAt,
+              let onset = AudioAnalysis.firstOnset(fileURL: url) else {
+            finish(.failure(MeasureError.noSignal))
+            return
+        }
+
+        let clickOffset = clickAt.timeIntervalSince(startedAt)
+        // 麦克风采集和播放启动有约 10ms 固定开销，扣掉
+        let ms = ((onset - clickOffset) - 0.01) * 1000
+
+        if ms < 15 || ms > 800 {
+            finish(.failure(MeasureError.outOfRange(ms)))
+        } else {
+            finish(.success(ms.rounded()))
+        }
+    }
+
+    private func finish(_ result: Result<Double, Error>) {
+        player?.stop()
+        player = nil
+        recorder = nil
+
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .default, options: [])
+        try? session.setActive(true)
+
+        let callback = completion
+        completion = nil
+        callback?(result)
+    }
+}
+
+// MARK: - 自动测量入口
+
+extension CompensateViewController {
+
+    @objc fileprivate func measureTapped() {
+        guard !exporting else { return }
+
+        statusLabel.text = "测量中：保持安静，车里会响一声"
+        Calibrator.shared.measure { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let ms):
+                self.offsetMs = ms
+                self.slider.value = Float(ms)
+                self.refresh()
+                OffsetStore.current = ms
+                Log.write("calibrated \(Int(ms))ms on \(OffsetStore.routeName)")
+                self.statusLabel.text = String(format: "测量完成：%.0f ms · 已保存到「%@」", ms, OffsetStore.routeName)
+            case .failure(let error):
+                Log.write("calibration failed: \(error.localizedDescription)")
+                self.statusLabel.text = "测量失败：\(error.localizedDescription)"
+            }
+        }
     }
 }
