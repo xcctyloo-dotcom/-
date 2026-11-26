@@ -6,6 +6,15 @@ import MediaPlayer
 import UIKit
 import UniformTypeIdentifiers
 
+// MARK: - 版本
+
+enum BuildInfo {
+    /// 每次发新包改这里，主菜单底部和日志里都能看到
+    static let version = "1.9"
+    static let note = "copy-fix"
+    static var display: String { "v\(version) · \(note)" }
+}
+
 // MARK: - 工具
 
 enum Format {
@@ -53,6 +62,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         TempCleaner.clean()
+        Log.write("launch \(BuildInfo.display)")
         AudioHub.shared.configureSession()
         return true
     }
@@ -149,7 +159,7 @@ final class MenuViewController: UIViewController {
         footer.numberOfLines = 0
         footer.font = .systemFont(ofSize: 12)
         footer.textColor = .tertiaryLabel
-        footer.text = "CarPlay 没有公开的视频通道。车机上放视频只能靠私有接口（CarMovie 那种），本 App 不做。"
+        footer.text = "CarPlay 没有公开的视频通道。车机上放视频只能靠私有接口（CarMovie 那种），本 App 不做。\n\(BuildInfo.display)"
         stack.addArrangedSubview(footer)
     }
 
@@ -2121,7 +2131,7 @@ final class LocalFileServer {
 
 // MARK: - 本地播放页
 
-final class LocalServerViewController: UIViewController, UITableViewDataSource {
+final class LocalServerViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
 
     private let table = UITableView(frame: .zero, style: .insetGrouped)
     private let toggleButton = UIButton(type: .system)
@@ -2152,6 +2162,7 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource {
         toggleButton.addAction(UIAction { [weak self] _ in self?.toggle() }, for: .touchUpInside)
 
         table.dataSource = self
+        table.delegate = self
         table.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
 
         let header = UIStackView(arrangedSubviews: [infoLabel, toggleButton])
@@ -2245,6 +2256,9 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource {
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
         guard let link = LocalFileServer.shared.url(for: files[indexPath.row]) else {
+            let alert = UIAlertController(title: "服务没启动", message: "先点上面的「启动本地服务」", preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "好", style: .default))
+            present(alert, animated: true)
             return
         }
         UIPasteboard.general.string = link
