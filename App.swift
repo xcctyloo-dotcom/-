@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "2.8"
-    static let note = "sample-dedup"
+    static let version = "3.0"
+    static let note = "triple-audit"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -47,7 +47,7 @@ enum TempCleaner {
                                                                        includingPropertiesForKeys: nil) else { return }
         for url in items {
             let name = url.lastPathComponent
-            if name.hasPrefix("source.") || name == "audio.m4a" {
+            if name.hasPrefix("source.") || name.hasPrefix("相机_") || name == "audio.m4a" || name == "cal.wav" || name == "cal.m4a" {
                 try? FileManager.default.removeItem(at: url)
             }
         }
@@ -835,6 +835,7 @@ final class CompensateViewController: UIViewController {
     private var actionButton: UIButton?
     private var lastExport: URL?
     private var outputs: [URL] = []
+    private var fileTimeout: DispatchWorkItem?
 
     private lazy var shareButton: UIButton = {
         var config = UIButton.Configuration.tinted()
@@ -880,6 +881,7 @@ final class CompensateViewController: UIViewController {
         slider.maximumValue = 400
         slider.value = Float(offsetMs)
         slider.addTarget(self, action: #selector(sliderChanged), for: .valueChanged)
+        slider.addTarget(self, action: #selector(sliderFinished), for: [.touchUpInside, .touchUpOutside, .touchCancel])
 
         progressBar.progress = 0
         progressBar.isHidden = true
@@ -973,6 +975,9 @@ final class CompensateViewController: UIViewController {
     @objc private func sliderChanged() {
         offsetMs = Double(slider.value).rounded()
         refresh()
+    }
+
+    @objc private func sliderFinished() {
         OffsetStore.current = offsetMs
     }
 
@@ -1082,12 +1087,24 @@ final class CompensateViewController: UIViewController {
 
         let url = sources[currentIndex]
         let startedAt = Date()
+
+        // 单个文件最长 15 分钟，卡住就放弃它、继续下一个
+        fileTimeout?.cancel()
+        let watchdog = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            Log.write("export timeout \(url.lastPathComponent)")
+            CompensateExporter.cancel()
+        }
+        fileTimeout = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + 900, execute: watchdog)
+
         CompensateExporter.export(source: url, offsetMs: offsetMs, progress: { [weak self] p in
             guard let self else { return }
             let overall = (Double(self.completed + self.failed) + p) / Double(max(1, self.sources.count))
             self.updateProgress(overall: overall, current: p)
         }, completion: { [weak self] result in
             guard let self else { return }
+            self.fileTimeout?.cancel()
 
             if self.cancelling {
                 self.finishQueue()
@@ -1371,10 +1388,20 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         var content = cell.defaultContentConfiguration()
         content.text = url.lastPathComponent
         let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-        if let info = VideoInfoCache.info(for: url) {
+        if let info = VideoInfoCache.cached(url) {
             content.secondaryText = info.summary + " · " + Format.bytes(size)
         } else {
             content.secondaryText = Format.bytes(size)
+            let row = indexPath.row
+            let path = url
+            VideoInfoCache.loadAsync(for: path) { [weak self] info in
+                guard let self, info != nil else { return }
+                guard row < self.files.count, self.files[row] == path else { return }
+                let target = IndexPath(row: row, section: 0)
+                guard let visible = self.table.indexPathsForVisibleRows,
+                      visible.contains(target) else { return }
+                self.table.reloadRows(at: [target], with: .none)
+            }
         }
         cell.contentConfiguration = content
         cell.accessoryType = selecting ? .none : .disclosureIndicator
@@ -1447,6 +1474,16 @@ final class AboutViewController: UIViewController {
         · 补偿值是每台车一个常数，换车、换有线/无线都要重调
         · 导出期间要留在前台，iOS 只给约 30 秒后台时间
         · 流媒体链接（m3u8）没法预先补偿，只能处理本地文件
+
+        本地播放
+
+        导出后在本机起一个 HTTP 服务，CarMovie 按 URL 播放，不用导入。
+        端口固定 8080，链接可长期复用；播放时手机停在本 App，服务才不会被挂起。
+
+        学习与分档
+
+        每次导出记录「码率 → 偏移」，累积 3 部以上且码率跨度够，就会拟合出规律，
+        选新片时自动给出参考值。码率分四档：低 <4、中 4-10、高 10-20、超高 >20 Mbps。
         """
         view.addSubview(text)
 
@@ -1500,13 +1537,30 @@ enum OffsetStore {
     static func storedOffset(forSize size: Int64) -> Double? {
         guard size > 0 else { return nil }
         let map = UserDefaults.standard.dictionary(forKey: fileKey) ?? [:]
-        return map["\(size)"] as? Double
+        if let value = map["\(size)"] as? Double { return value }   // 旧格式兼容
+        if let dict = map["\(size)"] as? [String: Any],
+           let value = dict["o"] as? Double {
+            return value
+        }
+        return nil
     }
 
     static func saveOffset(_ value: Double, forSize size: Int64) {
         guard size > 0 else { return }
         var map = UserDefaults.standard.dictionary(forKey: fileKey) ?? [:]
-        map["\(size)"] = value
+        map["\(size)"] = ["o": value, "t": Date().timeIntervalSince1970]
+
+        // 只留最近 300 部，避免 UserDefaults 越积越大
+        if map.count > 300 {
+            let sorted = map.sorted {
+                let l = (($0.value as? [String: Any])?["t"] as? Double) ?? 0
+                let r = (($1.value as? [String: Any])?["t"] as? Double) ?? 0
+                return l < r
+            }
+            for (key, _) in sorted.prefix(map.count - 300) {
+                map.removeValue(forKey: key)
+            }
+        }
         UserDefaults.standard.set(map, forKey: fileKey)
     }
 
@@ -2046,6 +2100,8 @@ final class LocalFileServer {
 
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: NWConnection] = [:]
+    /// 连接回调分散在多个后台队列，字典必须串行访问
+    private let lock = NSLock()
     private(set) var port: UInt16 = 0
 
     var isRunning: Bool { listener != nil }
@@ -2124,8 +2180,11 @@ final class LocalFileServer {
         listener?.cancel()
         listener = nil
         port = 0
-        connections.values.forEach { $0.cancel() }
+        lock.lock()
+        let all = connections.values
         connections.removeAll()
+        lock.unlock()
+        all.forEach { $0.cancel() }
     }
 
     func url(for file: URL) -> String? {
@@ -2137,12 +2196,18 @@ final class LocalFileServer {
     // MARK: 连接
 
     private func accept(_ connection: NWConnection) {
+        lock.lock()
+        let tooMany = connections.count >= 8
+        if !tooMany {
+            connections[ObjectIdentifier(connection)] = connection
+        }
+        lock.unlock()
+
         // 同时最多 8 条连接，防止被本地其它进程刷爆
-        if connections.count >= 8 {
+        if tooMany {
             connection.cancel()
             return
         }
-        connections[ObjectIdentifier(connection)] = connection
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
@@ -2178,7 +2243,9 @@ final class LocalFileServer {
     }
 
     private func close(_ connection: NWConnection) {
+        lock.lock()
         connections.removeValue(forKey: ObjectIdentifier(connection))
+        lock.unlock()
         connection.cancel()
     }
 
@@ -2210,7 +2277,14 @@ final class LocalFileServer {
         guard let first = lines.first else { close(connection); return }
 
         let parts = first.split(separator: " ")
-        guard parts.count >= 2, parts[0] == "GET" else { close(connection); return }
+        guard parts.count >= 2 else { close(connection); return }
+
+        let method = String(parts[0])
+        guard method == "GET" || method == "HEAD" else {
+            sendText(connection, status: "405 Method Not Allowed", text: "only GET/HEAD")
+            return
+        }
+        let isHead = (method == "HEAD")
 
         var path = String(parts[1])
         if let mark = path.firstIndex(of: "?") { path = String(path[..<mark]) }
@@ -2250,9 +2324,14 @@ final class LocalFileServer {
             guard let equal = value.firstIndex(of: "=") else { continue }
             let spec = value[value.index(after: equal)...]
             let bounds = spec.split(separator: "-", omittingEmptySubsequences: false)
-            if bounds.count == 2 {
-                if let start = Int(bounds[0]) { rangeStart = start }
+            guard bounds.count == 2 else { continue }
+            if let start = Int(bounds[0]) {
+                rangeStart = start
                 if let end = Int(bounds[1]) { rangeEnd = end }
+            } else if let suffix = Int(bounds[1]) {
+                // bytes=-N 表示最后 N 字节
+                rangeStart = max(0, total - suffix)
+                rangeEnd = total - 1
             }
         }
 
@@ -2269,6 +2348,14 @@ final class LocalFileServer {
             head += "Content-Range: bytes \(rangeStart)-\(rangeEnd)/\(total)\r\n"
         }
         head += "Connection: close\r\n\r\n"
+
+        if isHead {
+            connection.send(content: Data(head.utf8),
+                            contentContext: .finalMessage,
+                            isComplete: true,
+                            completion: .contentProcessed { [weak self] _ in self?.close(connection) })
+            return
+        }
 
         connection.send(content: Data(head.utf8),
                         contentContext: .defaultMessage,
@@ -2601,13 +2688,44 @@ extension VideoInfo {
 enum VideoInfoCache {
 
     private static var storage: [String: VideoInfo.Info] = [:]
+    private static let lock = NSLock()
+
+    private static func key(for url: URL) -> String {
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        return "\(url.lastPathComponent)-\(values?.fileSize ?? 0)-\(values?.contentModificationDate?.timeIntervalSince1970 ?? 0)"
+    }
+
+    static func cached(_ url: URL) -> VideoInfo.Info? {
+        let k = key(for: url)
+        lock.lock(); defer { lock.unlock() }
+        return storage[k]
+    }
+
+    private static func store(_ info: VideoInfo.Info, for url: URL) {
+        let k = key(for: url)
+        lock.lock()
+        storage[k] = info
+        if storage.count > 200 { storage.removeAll() }
+        lock.unlock()
+    }
 
     static func info(for url: URL) -> VideoInfo.Info? {
-        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-        let key = "\(url.lastPathComponent)-\(values?.fileSize ?? 0)-\(values?.contentModificationDate?.timeIntervalSince1970 ?? 0)"
-        if let hit = storage[key] { return hit }
+        if let hit = cached(url) { return hit }
         guard let info = VideoInfo.load(url) else { return nil }
-        storage[key] = info
+        store(info, for: url)
         return info
+    }
+
+    /// 后台解析，回调在主线程
+    static func loadAsync(for url: URL, completion: @escaping (VideoInfo.Info?) -> Void) {
+        if let hit = cached(url) {
+            completion(hit)
+            return
+        }
+        DispatchQueue.global(qos: .utility).async {
+            let info = VideoInfo.load(url)
+            if let info { store(info, for: url) }
+            DispatchQueue.main.async { completion(info) }
+        }
     }
 }
