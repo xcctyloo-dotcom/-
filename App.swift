@@ -1,6 +1,7 @@
 import AVFoundation
 import CarPlay
 import PhotosUI
+import Network
 import MediaPlayer
 import UIKit
 import UniformTypeIdentifiers
@@ -131,6 +132,9 @@ final class MenuViewController: UIViewController {
         addSection("给车机播放器用（CarMovie 等）")
         addCard("补偿版导出", "可批量：同一偏移排队导出多个视频") { [weak self] in
             self?.navigationController?.pushViewController(CompensateViewController(), animated: true)
+        }
+        addCard("本地播放（免导入）", "起本地链接，CarMovie 按 URL 直接播") { [weak self] in
+            self?.navigationController?.pushViewController(LocalServerViewController(), animated: true)
         }
         addCard("已导出文件", "批量选择、分享、删除导出的视频") { [weak self] in
             self?.navigationController?.pushViewController(ExportedFilesViewController(), animated: true)
@@ -820,6 +824,7 @@ final class CompensateViewController: UIViewController {
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
     private var actionButton: UIButton?
     private var lastExport: URL?
+    private var outputs: [URL] = []
 
     private lazy var shareButton: UIButton = {
         var config = UIButton.Configuration.tinted()
@@ -1008,6 +1013,7 @@ final class CompensateViewController: UIViewController {
         failed = 0
         currentIndex = 0
         lastExport = nil
+        outputs = []
         startedAt = Date()
         shareButton.isHidden = true
         progressBar.isHidden = false
@@ -1046,6 +1052,7 @@ final class CompensateViewController: UIViewController {
             case .success(let output):
                 self.completed += 1
                 self.lastExport = output
+                self.outputs.append(output)
             case .failure(let error):
                 self.failed += 1
                 Log.write("export failed \(url.lastPathComponent): \(error.localizedDescription)")
@@ -1065,8 +1072,15 @@ final class CompensateViewController: UIViewController {
         UIApplication.shared.isIdleTimerDisabled = false
         endBackground()
 
+        if sources.count == 1 {
+            OffsetStore.saveOffset(offsetMs, forSize: sourceSizes.first ?? 0)
+        }
+
         if let lastExport {
             shareButton.isHidden = false
+            var config = shareButton.configuration
+            config?.title = outputs.count > 1 ? "一次性交给 CarMovie（\(outputs.count) 个）" : "分享这份文件"
+            shareButton.configuration = config
             let size = Int64((try? lastExport.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
             if sources.count > 1 {
                 statusLabel.text = "完成 \(completed) 个，失败 \(failed) 个\(wasCancelled ? "（已取消）" : "")\n最后一份 \(Format.bytes(size)) · 文件 App → CarPlayCast"
@@ -1101,8 +1115,9 @@ final class CompensateViewController: UIViewController {
     }
 
     private func presentShare() {
-        guard let lastExport else { return }
-        let controller = UIActivityViewController(activityItems: [lastExport], applicationActivities: nil)
+        let items = outputs.isEmpty ? (lastExport.map { [$0] } ?? []) : outputs
+        guard !items.isEmpty else { return }
+        let controller = UIActivityViewController(activityItems: items, applicationActivities: nil)
         controller.popoverPresentationController?.sourceView = shareButton
         present(controller, animated: true)
     }
@@ -1418,6 +1433,22 @@ enum OffsetStore {
             UserDefaults.standard.set(map, forKey: mapKey)
             UserDefaults.standard.set(newValue, forKey: lastKey)
         }
+    }
+
+    private static let fileKey = "offsetByFile"
+
+    /// 用文件体积做指纹：同一部片子反复导入，体积不变
+    static func storedOffset(forSize size: Int64) -> Double? {
+        guard size > 0 else { return nil }
+        let map = UserDefaults.standard.dictionary(forKey: fileKey) ?? [:]
+        return map["\(size)"] as? Double
+    }
+
+    static func saveOffset(_ value: Double, forSize size: Int64) {
+        guard size > 0 else { return }
+        var map = UserDefaults.standard.dictionary(forKey: fileKey) ?? [:]
+        map["\(size)"] = value
+        UserDefaults.standard.set(map, forKey: fileKey)
     }
 
     static var summary: String {
@@ -1810,13 +1841,385 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
         shareButton.isHidden = true
 
         let total = sourceSizes.reduce(0, +)
-        if urls.count > 1 {
+        if urls.count == 1, let first = urls.first {
+            var note = ""
+            if let remembered = OffsetStore.storedOffset(forSize: sourceSizes.first ?? 0) {
+                offsetMs = remembered
+                slider.value = Float(remembered)
+                note = String(format: " · 已载入上次的 %.0f ms", remembered)
+            }
+            statusLabel.text = "已选：\(first.lastPathComponent) · \(Format.bytes(total))\(note)"
+        } else if urls.count > 1 {
             statusLabel.text = "已选 \(urls.count) 个 · 共 \(Format.bytes(total))"
-        } else if let first = urls.first {
-            statusLabel.text = "已选：\(first.lastPathComponent) · \(Format.bytes(total))"
         } else {
             statusLabel.text = "没选到视频"
         }
         refresh()
+    }
+}
+
+// MARK: - 本地 HTTP 服务（给 CarMovie 之类按 URL 播的播放器用）
+
+import Network
+
+final class LocalFileServer {
+
+    static let shared = LocalFileServer()
+
+    private var listener: NWListener?
+    private var connections: [ObjectIdentifier: NWConnection] = [:]
+    private(set) var port: UInt16 = 0
+
+    var isRunning: Bool { listener != nil }
+
+    private init() {}
+
+    func start(completion: @escaping (UInt16) -> Void) {
+        guard listener == nil else {
+            completion(port)
+            return
+        }
+
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
+
+        guard let listener = try? NWListener(using: params) else {
+            completion(0)
+            return
+        }
+
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.accept(connection)
+        }
+        listener.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.port = listener.port?.rawValue ?? 0
+                completion(self.port)
+            case .failed, .cancelled:
+                self.listener = nil
+                self.port = 0
+            default:
+                break
+            }
+        }
+
+        self.listener = listener
+        listener.start(queue: .global(qos: .userInitiated))
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        port = 0
+        connections.values.forEach { $0.cancel() }
+        connections.removeAll()
+    }
+
+    func url(for file: URL) -> String? {
+        guard port != 0 else { return nil }
+        let name = file.lastPathComponent.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? file.lastPathComponent
+        return "http://127.0.0.1:\(port)/\(name)"
+    }
+
+    // MARK: 连接
+
+    private func accept(_ connection: NWConnection) {
+        connections[ObjectIdentifier(connection)] = connection
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled:
+                self?.close(connection)
+            default:
+                break
+            }
+        }
+        connection.start(queue: .global(qos: .userInitiated))
+        receive(on: connection, buffer: Data())
+    }
+
+    private func close(_ connection: NWConnection) {
+        connections.removeValue(forKey: ObjectIdentifier(connection))
+        connection.cancel()
+    }
+
+    private func receive(on connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, isComplete, error in
+            guard let self else { return }
+
+            var accumulated = buffer
+            if let data { accumulated.append(data) }
+
+            if let headerEnd = accumulated.range(of: Data("\r\n\r\n".utf8)) {
+                let header = String(decoding: accumulated[..<headerEnd.lowerBound], as: UTF8.self)
+                self.respond(on: connection, request: header)
+                return
+            }
+
+            if isComplete || error != nil || accumulated.count > 64 * 1024 {
+                self.close(connection)
+                return
+            }
+            self.receive(on: connection, buffer: accumulated)
+        }
+    }
+
+    // MARK: 响应
+
+    private func respond(on connection: NWConnection, request: String) {
+        let lines = request.split(separator: "\r\n", omittingEmptySubsequences: false)
+        guard let first = lines.first else { close(connection); return }
+
+        let parts = first.split(separator: " ")
+        guard parts.count >= 2, parts[0] == "GET" else { close(connection); return }
+
+        var path = String(parts[1])
+        if let mark = path.firstIndex(of: "?") { path = String(path[..<mark]) }
+        path = path.removingPercentEncoding ?? path
+
+        let name = (path as NSString).lastPathComponent
+        guard !name.isEmpty, !name.contains("..") else { close(connection); return }
+
+        let file = CompensateExporter.documentsDir().appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath: file.path) else {
+            sendText(connection, status: "404 Not Found", text: "not found")
+            return
+        }
+
+        guard let attributes = try? file.resourceValues(forKeys: [.fileSizeKey]),
+              let total = attributes.fileSize else {
+            sendText(connection, status: "500 Internal Server Error", text: "no size")
+            return
+        }
+
+        var rangeStart = 0
+        var rangeEnd = total - 1
+
+        for line in lines.dropFirst() where line.lowercased().hasPrefix("range:") {
+            let value = String(line.dropFirst("range:".count)).trimmingCharacters(in: .whitespaces)
+            guard let equal = value.firstIndex(of: "=") else { continue }
+            let spec = value[value.index(after: equal)...]
+            let bounds = spec.split(separator: "-", omittingEmptySubsequences: false)
+            if bounds.count == 2 {
+                if let start = Int(bounds[0]) { rangeStart = start }
+                if let end = Int(bounds[1]) { rangeEnd = end }
+            }
+        }
+
+        rangeStart = max(0, min(rangeStart, total - 1))
+        rangeEnd = max(rangeStart, min(rangeEnd, total - 1))
+        let length = rangeEnd - rangeStart + 1
+        let isPartial = (rangeStart != 0 || rangeEnd != total - 1)
+
+        var head = "HTTP/1.1 " + (isPartial ? "206 Partial Content" : "200 OK") + "\r\n"
+        head += "Content-Type: video/mp4\r\n"
+        head += "Accept-Ranges: bytes\r\n"
+        head += "Content-Length: \(length)\r\n"
+        if isPartial {
+            head += "Content-Range: bytes \(rangeStart)-\(rangeEnd)/\(total)\r\n"
+        }
+        head += "Connection: close\r\n\r\n"
+
+        connection.send(content: Data(head.utf8),
+                        contentContext: .defaultMessage,
+                        isComplete: false,
+                        completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if error != nil {
+                self.close(connection)
+                return
+            }
+            guard let handle = try? FileHandle(forReadingFrom: file) else {
+                self.close(connection)
+                return
+            }
+            handle.seek(toFileOffset: UInt64(rangeStart))
+            self.pump(handle: handle, remaining: length, connection: connection)
+        })
+    }
+
+    private func pump(handle: FileHandle, remaining: Int, connection: NWConnection) {
+        if remaining <= 0 {
+            try? handle.close()
+            connection.send(content: nil,
+                            contentContext: .finalMessage,
+                            isComplete: true,
+                            completion: .contentProcessed { [weak self] _ in
+                self?.close(connection)
+            })
+            return
+        }
+
+        let chunk = min(256 * 1024, remaining)
+        let data = handle.readData(ofLength: chunk)
+        guard !data.isEmpty else {
+            try? handle.close()
+            close(connection)
+            return
+        }
+
+        connection.send(content: data,
+                        contentContext: .defaultMessage,
+                        isComplete: false,
+                        completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if error != nil {
+                try? handle.close()
+                self.close(connection)
+                return
+            }
+            self.pump(handle: handle, remaining: remaining - data.count, connection: connection)
+        })
+    }
+
+    private func sendText(_ connection: NWConnection, status: String, text: String) {
+        let body = Data(text.utf8)
+        var head = "HTTP/1.1 \(status)\r\n"
+        head += "Content-Type: text/plain; charset=utf-8\r\n"
+        head += "Content-Length: \(body.count)\r\n"
+        head += "Connection: close\r\n\r\n"
+
+        var payload = Data(head.utf8)
+        payload.append(body)
+        connection.send(content: payload,
+                        contentContext: .finalMessage,
+                        isComplete: true,
+                        completion: .contentProcessed { [weak self] _ in
+            self?.close(connection)
+        })
+    }
+}
+
+// MARK: - 本地播放页
+
+final class LocalServerViewController: UIViewController, UITableViewDataSource {
+
+    private let table = UITableView(frame: .zero, style: .insetGrouped)
+    private let toggleButton = UIButton(type: .system)
+    private let infoLabel = UILabel()
+
+    private var files: [URL] = []
+    private var baseURL: String = "未启动"
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "本地播放"
+        view.backgroundColor = .systemGroupedBackground
+
+        infoLabel.numberOfLines = 0
+        infoLabel.font = .systemFont(ofSize: 12)
+        infoLabel.textColor = .secondaryLabel
+        infoLabel.text = """
+        启动后，在 CarMovie 的「添加 URL」里粘贴下面的链接即可播放，不用导入。
+
+        注意：播放时本 App 会进入后台，服务可能被挂起。
+        视频不大时 CarMovie 能先缓冲完，就能继续播。
+        """
+
+        var config = UIButton.Configuration.filled()
+        config.title = "启动本地服务"
+        config.cornerStyle = .medium
+        toggleButton.configuration = config
+        toggleButton.addAction(UIAction { [weak self] _ in self?.toggle() }, for: .touchUpInside)
+
+        table.dataSource = self
+        table.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
+
+        let header = UIStackView(arrangedSubviews: [infoLabel, toggleButton])
+        header.axis = .vertical
+        header.spacing = 10
+        header.translatesAutoresizingMaskIntoConstraints = false
+
+        table.translatesAutoresizingMaskIntoConstraints = false
+
+        view.addSubview(header)
+        view.addSubview(table)
+
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            header.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+
+            table.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
+            table.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            table.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            table.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        reload()
+    }
+
+    private func reload() {
+        let dir = CompensateExporter.documentsDir()
+        let urls = (try? FileManager.default.contentsOfDirectory(at: dir,
+                                                                 includingPropertiesForKeys: [.fileSizeKey])) ?? []
+        files = urls.filter { $0.pathExtension.lowercased() == "mp4" }
+        table.reloadData()
+    }
+
+    private func toggle() {
+        if LocalFileServer.shared.isRunning {
+            LocalFileServer.shared.stop()
+            baseURL = "未启动"
+            updateButton()
+            table.reloadData()
+            return
+        }
+
+        LocalFileServer.shared.start { [weak self] port in
+            guard let self else { return }
+            self.baseURL = port == 0 ? "启动失败" : "http://127.0.0.1:\(port)"
+            self.updateButton()
+            self.table.reloadData()
+        }
+    }
+
+    private func updateButton() {
+        var config = toggleButton.configuration
+        config?.title = LocalFileServer.shared.isRunning ? "停止本地服务" : "启动本地服务"
+        toggleButton.configuration = config
+    }
+
+    // MARK: 表格
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        files.count
+    }
+
+    func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
+        "点击复制链接 · 当前 \(baseURL)"
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "cell", for: indexPath)
+        let file = files[indexPath.row]
+
+        var content = cell.defaultContentConfiguration()
+        content.text = file.lastPathComponent
+        if let link = LocalFileServer.shared.url(for: file) {
+            content.secondaryText = link
+            content.secondaryTextProperties.color = .systemBlue
+        } else {
+            content.secondaryText = "先启动服务"
+            content.secondaryTextProperties.color = .tertiaryLabel
+        }
+        cell.contentConfiguration = content
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        guard let link = LocalFileServer.shared.url(for: files[indexPath.row]) else {
+            return
+        }
+        UIPasteboard.general.string = link
+        let alert = UIAlertController(title: "已复制", message: link, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "好", style: .default))
+        present(alert, animated: true)
     }
 }
