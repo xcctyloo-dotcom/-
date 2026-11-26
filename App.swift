@@ -1882,9 +1882,10 @@ final class LocalFileServer {
 
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
-        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
 
-        guard let listener = try? NWListener(using: params) else {
+        // 注意：不能给“监听器”设 requiredLocalEndpoint，会直接崩溃。
+        // 只接受本机连接，靠下面的 isLoopback 过滤。
+        guard let listener = try? NWListener(using: params, on: .any) else {
             completion(0)
             return
         }
@@ -1930,6 +1931,11 @@ final class LocalFileServer {
         connections[ObjectIdentifier(connection)] = connection
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
+            case .ready:
+                guard let self else { return }
+                if !self.isLoopback(connection) {
+                    self.close(connection)
+                }
             case .failed, .cancelled:
                 self?.close(connection)
             default:
@@ -1938,6 +1944,15 @@ final class LocalFileServer {
         }
         connection.start(queue: .global(qos: .userInitiated))
         receive(on: connection, buffer: Data())
+    }
+
+    private func isLoopback(_ connection: NWConnection) -> Bool {
+        guard let remote = connection.currentPath?.remoteEndpoint,
+              case let .hostPort(host, _) = remote else {
+            return false
+        }
+        let text = "\(host)"
+        return text.contains("127.0.0.1") || text.contains("::1")
     }
 
     private func close(_ connection: NWConnection) {
