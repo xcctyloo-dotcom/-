@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "2.1"
-    static let note = "fixed-port"
+    static let version = "2.5"
+    static let note = "regression"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -818,6 +818,7 @@ final class CompensateViewController: UIViewController {
     private let stack = UIStackView()
     private let valueLabel = UILabel()
     private let statusLabel = UILabel()
+    private let learnLabel = UILabel()
     private let slider = UISlider()
     private let progressBar = UIProgressView(progressViewStyle: .default)
 
@@ -843,6 +844,11 @@ final class CompensateViewController: UIViewController {
         button.addAction(UIAction { [weak self] _ in self?.presentShare() }, for: .touchUpInside)
         return button
     }()
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        refreshLearnLabel()
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -882,6 +888,10 @@ final class CompensateViewController: UIViewController {
         statusLabel.textColor = .secondaryLabel
         statusLabel.numberOfLines = 0
 
+        learnLabel.font = .systemFont(ofSize: 11)
+        learnLabel.textColor = .tertiaryLabel
+        learnLabel.numberOfLines = 0
+
         let presetRow = UIStackView(arrangedSubviews: [
             makePresetButton("−100", -100),
             makePresetButton("0", 0),
@@ -907,7 +917,7 @@ final class CompensateViewController: UIViewController {
          makeButton("自动测量延迟", #selector(measureTapped)),
          makeButton("从相册选择（可多选）", #selector(pickFromPhotos)),
          makeButton("从文件选择（可多选）", #selector(pickVideo)),
-         exportButton, progressBar, statusLabel, shareButton].forEach { stack.addArrangedSubview($0) }
+         exportButton, progressBar, statusLabel, shareButton, learnLabel].forEach { stack.addArrangedSubview($0) }
         view.addSubview(stack)
 
         NSLayoutConstraint.activate([
@@ -934,6 +944,16 @@ final class CompensateViewController: UIViewController {
         button.titleLabel?.font = .systemFont(ofSize: 13, weight: .medium)
         button.addAction(UIAction { [weak self] _ in self?.applyPreset(value) }, for: .touchUpInside)
         return button
+    }
+
+    private func refreshLearnLabel() {
+        if let fit = OffsetStore.fit() {
+            learnLabel.text = String(format: "已学 %d 组样本：码率每 +1 Mbps，补偿多 %+.1f ms", fit.count, fit.slope)
+        } else if OffsetStore.sampleCount > 0 {
+            learnLabel.text = "已记录 \(OffsetStore.sampleCount) 组样本（≥3 组且码率跨度 ≥2 Mbps 才会形成规律）"
+        } else {
+            learnLabel.text = "还没有样本：导出一两次后开始学习"
+        }
     }
 
     private func setActionTitle(_ title: String) {
@@ -1083,6 +1103,10 @@ final class CompensateViewController: UIViewController {
 
         if sources.count == 1 {
             OffsetStore.saveOffset(offsetMs, forSize: sourceSizes.first ?? 0)
+            refreshLearnLabel()
+            if let info = sources.first.flatMap({ VideoInfo.load($0) }) {
+                OffsetStore.recordSample(mbps: info.megabitsPerSecond, offset: offsetMs)
+            }
         }
 
         if let lastExport {
@@ -1325,7 +1349,11 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         var content = cell.defaultContentConfiguration()
         content.text = url.lastPathComponent
         let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-        content.secondaryText = Format.bytes(size)
+        if let info = VideoInfoCache.info(for: url) {
+            content.secondaryText = info.summary + " · " + Format.bytes(size)
+        } else {
+            content.secondaryText = Format.bytes(size)
+        }
         cell.contentConfiguration = content
         cell.accessoryType = selecting ? .none : .disclosureIndicator
         return cell
@@ -1458,6 +1486,75 @@ enum OffsetStore {
         var map = UserDefaults.standard.dictionary(forKey: fileKey) ?? [:]
         map["\(size)"] = value
         UserDefaults.standard.set(map, forKey: fileKey)
+    }
+
+    private static let samplesKey = "offsetSamples"
+
+    static func recordSample(mbps: Double, offset: Double) {
+        guard mbps > 0 else { return }
+        var array = UserDefaults.standard.array(forKey: samplesKey) as? [[String: Any]] ?? []
+        array.append(["m": mbps, "o": offset])
+        if array.count > 200 { array.removeFirst(array.count - 200) }
+        UserDefaults.standard.set(array, forKey: samplesKey)
+    }
+
+    struct Fit {
+        let slope: Double
+        let intercept: Double
+        let count: Int
+    }
+
+    static var sampleCount: Int {
+        (UserDefaults.standard.array(forKey: samplesKey) as? [[String: Any]] ?? []).count
+    }
+
+    /// 最小二乘：偏移 ≈ slope × 码率 + intercept
+    static func fit() -> Fit? {
+        let array = UserDefaults.standard.array(forKey: samplesKey) as? [[String: Any]] ?? []
+        let points: [(Double, Double)] = array.compactMap {
+            guard let m = $0["m"] as? Double, let o = $0["o"] as? Double else { return nil }
+            return (m, o)
+        }
+        guard points.count >= 3 else { return nil }
+
+        let xs = points.map { $0.0 }
+        guard let minX = xs.min(), let maxX = xs.max(), maxX - minX >= 2 else { return nil }
+
+        let n = Double(points.count)
+        let sumX = xs.reduce(0, +)
+        let sumY = points.reduce(0) { $0 + $1.1 }
+        let sumXY = points.reduce(0) { $0 + $1.0 * $1.1 }
+        let sumXX = points.reduce(0) { $0 + $1.0 * $1.0 }
+
+        let denominator = n * sumXX - sumX * sumX
+        guard abs(denominator) > 0.0001 else { return nil }
+
+        let slope = (n * sumXY - sumX * sumY) / denominator
+        let intercept = (sumY - slope * sumX) / n
+        return Fit(slope: slope, intercept: intercept, count: points.count)
+    }
+
+    static func predict(mbps: Double) -> Double? {
+        guard mbps > 0, let fit = fit() else { return nil }
+        let value = fit.slope * mbps + fit.intercept
+        return min(-20, max(-400, value)).rounded()
+    }
+
+    /// 按码率相近的历史样本推测偏移
+    static func suggestion(forMbps mbps: Double) -> Double? {
+        guard mbps > 0 else { return nil }
+        let array = UserDefaults.standard.array(forKey: samplesKey) as? [[String: Any]] ?? []
+        let tolerance = max(1.0, mbps * 0.4)
+        let values = array.compactMap { sample -> Double? in
+            guard let m = sample["m"] as? Double,
+                  let o = sample["o"] as? Double,
+                  abs(m - mbps) <= tolerance else { return nil }
+            return o
+        }.sorted()
+        if values.count >= 2 {
+            return values[values.count / 2]
+        }
+        return predict(mbps: mbps)
     }
 
     static var summary: String {
@@ -1825,8 +1922,10 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
                 let formatter = DateFormatter()
                 formatter.dateFormat = "MMdd_HHmmss"
                 let stamp = formatter.string(from: Date())
+                // 两位编号：\(01, 02 … 11)，按字符串排序也不会乱
+                let seq = String(format: "%02d", index + 1)
                 let dst = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("相机_\(stamp)_\(index + 1).\(ext)")
+                    .appendingPathComponent("相机_\(stamp)_\(seq).\(ext)")
                 try? FileManager.default.removeItem(at: dst)
                 if (try? FileManager.default.copyItem(at: url, to: dst)) != nil {
                     copied = dst
@@ -1851,15 +1950,39 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
 
         let total = sourceSizes.reduce(0, +)
         if urls.count == 1, let first = urls.first {
+            let info = VideoInfo.load(first)
             var note = ""
             if let remembered = OffsetStore.storedOffset(forSize: sourceSizes.first ?? 0) {
                 offsetMs = remembered
                 slider.value = Float(remembered)
                 note = String(format: " · 已载入上次的 %.0f ms", remembered)
+            } else if let info, let suggested = OffsetStore.suggestion(forMbps: info.megabitsPerSecond) {
+                offsetMs = suggested
+                slider.value = Float(suggested)
+                note = String(format: " · 按同码率推测 %.0f ms", suggested)
             }
-            statusLabel.text = "已选：\(first.lastPathComponent) · \(Format.bytes(total))\(note)"
+
+            var lines = ["已选：\(first.lastPathComponent) · \(Format.bytes(total))\(note)"]
+            if let info {
+                lines.append("画面 \(info.summary)")
+            }
+            statusLabel.text = lines.joined(separator: "\n")
         } else if urls.count > 1 {
-            statusLabel.text = "已选 \(urls.count) 个 · 共 \(Format.bytes(total))"
+            var counts: [String: Int] = [:]
+            for url in urls {
+                if let info = VideoInfoCache.info(for: url) {
+                    counts[info.category.rawValue, default: 0] += 1
+                }
+            }
+            var text = "已选 \(urls.count) 个 · 共 \(Format.bytes(total))"
+            if !counts.isEmpty {
+                let detail = counts.map { "\($0.key) \($0.value)" }.sorted().joined(separator: " · ")
+                text += "\n" + detail
+                if counts.count > 1 {
+                    text += "\n码率不一致，建议分组导出，偏移值会差不少"
+                }
+            }
+            statusLabel.text = text
         } else {
             statusLabel.text = "没选到视频"
         }
@@ -2325,5 +2448,114 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
         let alert = UIAlertController(title: "已复制", message: link, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "好", style: .default))
         present(alert, animated: true)
+    }
+}
+
+// MARK: - 视频参数
+
+enum VideoInfo {
+
+    struct Info {
+        let width: Int
+        let height: Int
+        let fps: Double
+        let megabitsPerSecond: Double
+        let codec: String
+        let seconds: Double
+
+        var category: Category {
+            Category.of(megabitsPerSecond)
+        }
+
+        var summary: String {
+            let size = width > 0 ? "\(width)×\(height)" : "分辨率未知"
+            let fpsText = fps > 0 ? String(format: "%.0ffps", fps) : "帧率未知"
+            let rateText = megabitsPerSecond > 0
+                ? String(format: "%.1f Mbps", megabitsPerSecond)
+                : "码率未知"
+            return "\(size) · \(fpsText) · \(rateText) · \(codec) · \(Format.time(seconds))"
+        }
+    }
+
+    static func load(_ url: URL) -> Info? {
+        let asset = AVURLAsset(url: url)
+        guard let track = asset.tracks(withMediaType: .video).first else { return nil }
+
+        let transformed = track.naturalSize.applying(track.preferredTransform)
+        let width = Int(abs(transformed.width).rounded())
+        let height = Int(abs(transformed.height).rounded())
+
+        var codec = "编码未知"
+        if let description = track.formatDescriptions.first as? CMFormatDescription {
+            codec = fourCC(CMFormatDescriptionGetMediaSubType(description))
+        }
+
+        return Info(width: width,
+                    height: height,
+                    fps: Double(track.nominalFrameRate),
+                    megabitsPerSecond: Double(track.estimatedDataRate) / 1_000_000,
+                    codec: codec,
+                    seconds: CMTimeGetSeconds(asset.duration))
+    }
+
+    private static func fourCC(_ value: FourCharCode) -> String {
+        let bytes: [UInt8] = [
+            UInt8((value >> 24) & 0xFF),
+            UInt8((value >> 16) & 0xFF),
+            UInt8((value >> 8) & 0xFF),
+            UInt8(value & 0xFF)
+        ]
+        let text = String(bytes: bytes, encoding: .isoLatin1) ?? ""
+        switch text {
+        case "hvc1", "hev1": return "HEVC"
+        case "avc1": return "H.264"
+        case "vp09": return "VP9"
+        case "av01": return "AV1"
+        default: return text.isEmpty ? "编码未知" : text
+        }
+    }
+}
+
+// MARK: - 码率分档
+
+extension VideoInfo {
+
+    enum Category: String, CaseIterable {
+        case low = "低码率"
+        case medium = "中码率"
+        case high = "高码率"
+        case ultra = "超高码率"
+
+        static func of(_ mbps: Double) -> Category {
+            guard mbps > 0 else { return .medium }
+            if mbps < 4 { return .low }
+            if mbps < 10 { return .medium }
+            if mbps < 20 { return .high }
+            return .ultra
+        }
+
+        var hint: String {
+            switch self {
+            case .low: return "解码压力小，补偿可以少一些"
+            case .medium: return "常见 MV 区间"
+            case .high: return "解码缓冲明显变大"
+            case .ultra: return "4K / 高帧率，补偿往往要到 -300 以下"
+            }
+        }
+    }
+}
+
+/// 读一次缓存一次，列表滚动时不会反复解析
+enum VideoInfoCache {
+
+    private static var storage: [String: VideoInfo.Info] = [:]
+
+    static func info(for url: URL) -> VideoInfo.Info? {
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let key = "\(url.lastPathComponent)-\(values?.fileSize ?? 0)-\(values?.contentModificationDate?.timeIntervalSince1970 ?? 0)"
+        if let hit = storage[key] { return hit }
+        guard let info = VideoInfo.load(url) else { return nil }
+        storage[key] = info
+        return info
     }
 }
