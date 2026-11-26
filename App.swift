@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "1.9"
-    static let note = "copy-fix"
+    static let version = "2.0"
+    static let note = "playlist"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -1968,6 +1968,14 @@ final class LocalFileServer {
         receive(on: connection, buffer: Data())
     }
 
+    private func playlistFiles() -> [URL] {
+        let dir = CompensateExporter.documentsDir()
+        let urls = (try? FileManager.default.contentsOfDirectory(at: dir,
+                                                                 includingPropertiesForKeys: nil)) ?? []
+        return urls.filter { $0.pathExtension.lowercased() == "mp4" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
     private func isLoopback(_ connection: NWConnection) -> Bool {
         guard let remote = connection.currentPath?.remoteEndpoint,
               case let .hostPort(host, _) = remote else {
@@ -2018,6 +2026,17 @@ final class LocalFileServer {
 
         let name = (path as NSString).lastPathComponent
         guard !name.isEmpty, !name.contains("..") else { close(connection); return }
+
+        if name == "playlist.m3u" {
+            var lines = ["#EXTM3U"]
+            for item in playlistFiles() {
+                let encoded = item.lastPathComponent.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? item.lastPathComponent
+                lines.append("#EXTINF:-1,\(item.deletingPathExtension().lastPathComponent)")
+                lines.append("http://127.0.0.1:\(port)/\(encoded)")
+            }
+            sendText(connection, status: "200 OK", text: lines.joined(separator: "\n"))
+            return
+        }
 
         let file = CompensateExporter.documentsDir().appendingPathComponent(name)
         guard FileManager.default.fileExists(atPath: file.path) else {
@@ -2135,6 +2154,7 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
 
     private let table = UITableView(frame: .zero, style: .insetGrouped)
     private let toggleButton = UIButton(type: .system)
+    private let playlistButton = UIButton(type: .system)
     private let infoLabel = UILabel()
 
     private var files: [URL] = []
@@ -2149,7 +2169,7 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
         infoLabel.font = .systemFont(ofSize: 12)
         infoLabel.textColor = .secondaryLabel
         infoLabel.text = """
-        启动后，在 CarMovie 的「添加 URL」里粘贴下面的链接即可播放，不用导入。
+        启动后，在 CarMovie 的「添加 URL」里粘贴下面的链接即可播放，不用导入。\n也可以只添加一个「播放列表」链接，一次带出全部视频。
 
         注意：播放时本 App 会进入后台，服务可能被挂起。
         视频不大时 CarMovie 能先缓冲完，就能继续播。
@@ -2165,7 +2185,13 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
         table.delegate = self
         table.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
 
-        let header = UIStackView(arrangedSubviews: [infoLabel, toggleButton])
+        var playlistConfig = UIButton.Configuration.tinted()
+        playlistConfig.title = "复制播放列表链接（一次添加全部）"
+        playlistConfig.cornerStyle = .medium
+        playlistButton.configuration = playlistConfig
+        playlistButton.addAction(UIAction { [weak self] _ in self?.copyPlaylist() }, for: .touchUpInside)
+
+        let header = UIStackView(arrangedSubviews: [infoLabel, toggleButton, playlistButton])
         header.axis = .vertical
         header.spacing = 10
         header.translatesAutoresizingMaskIntoConstraints = false
@@ -2218,6 +2244,22 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
                 self.table.reloadData()
             }
         }
+    }
+
+    private func copyPlaylist() {
+        guard LocalFileServer.shared.isRunning else {
+            let alert = UIAlertController(title: "服务没启动", message: "先点上面的「启动本地服务」", preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "好", style: .default))
+            present(alert, animated: true)
+            return
+        }
+        let link = "http://127.0.0.1:\(LocalFileServer.shared.port)/playlist.m3u"
+        UIPasteboard.general.string = link
+        let alert = UIAlertController(title: "播放列表已复制",
+                                      message: "\(link)\n\n在 CarMovie 里添加这一个链接，它会列出全部视频。",
+                                      preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "好", style: .default))
+        present(alert, animated: true)
     }
 
     private func updateButton() {
