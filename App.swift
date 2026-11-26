@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "2.6"
-    static let note = "cast-fix"
+    static let version = "2.7"
+    static let note = "stability"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -1026,13 +1026,29 @@ final class CompensateViewController: UIViewController {
                                           preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "先不导", style: .cancel))
             alert.addAction(UIAlertAction(title: "继续", style: .default) { [weak self] _ in
-                self?.startQueue()
+                self?.confirmOverwrite { [weak self] in self?.startQueue() }
             })
             present(alert, animated: true)
             return
         }
 
-        startQueue()
+        confirmOverwrite { [weak self] in self?.startQueue() }
+    }
+
+    private func confirmOverwrite(_ completion: @escaping () -> Void) {
+        let existing = sources.filter {
+            FileManager.default.fileExists(atPath: CompensateExporter.outputURL(source: $0, offsetMs: offsetMs).path)
+        }
+        guard !existing.isEmpty else {
+            completion()
+            return
+        }
+        let alert = UIAlertController(title: "会覆盖 \(existing.count) 个已有文件",
+                                      message: "同名导出文件已经存在，继续会替换掉它。",
+                                      preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        alert.addAction(UIAlertAction(title: "覆盖", style: .default) { _ in completion() })
+        present(alert, animated: true)
     }
 
     private func startQueue() {
@@ -1582,6 +1598,10 @@ enum Log {
         guard let data = line.data(using: .utf8) else { return }
 
         let url = fileURL()
+        // 超过 300KB 清空，避免长期使用后日志无限膨胀
+        if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 300_000 {
+            try? FileManager.default.removeItem(at: url)
+        }
         if let handle = try? FileHandle(forWritingTo: url) {
             handle.seekToEndOfFile()
             handle.write(data)
@@ -2091,6 +2111,11 @@ final class LocalFileServer {
     // MARK: 连接
 
     private func accept(_ connection: NWConnection) {
+        // 同时最多 8 条连接，防止被本地其它进程刷爆
+        if connections.count >= 8 {
+            connection.cancel()
+            return
+        }
         connections[ObjectIdentifier(connection)] = connection
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
