@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "2.5"
-    static let note = "regression"
+    static let version = "2.6"
+    static let note = "cast-fix"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -2486,7 +2486,8 @@ enum VideoInfo {
         let height = Int(abs(transformed.height).rounded())
 
         var codec = "编码未知"
-        if let description = track.formatDescriptions.first as? CMFormatDescription {
+        if let list = track.formatDescriptions as? [CMFormatDescription],
+           let description = list.first {
             codec = fourCC(CMFormatDescriptionGetMediaSubType(description))
         }
 
