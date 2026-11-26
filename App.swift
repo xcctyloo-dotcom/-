@@ -1663,38 +1663,42 @@ final class Calibrator {
         recorder?.stop()
         recorder = nil
 
-        guard let url, startedAt != nil else {
+        guard let url else {
             finish(.failure(MeasureError.noSignal))
             return
         }
 
         let onsets = AudioAnalysis.onsets(fileURL: url)
-        guard let firstOnset = onsets.first else {
+        guard !onsets.isEmpty else {
             finish(.failure(MeasureError.noSignal))
             return
         }
 
-        // 用第一次咔哒对齐
-        let raw = firstOnset - Self.clickTimes[0]
+        // 不假设“第几个起音”对应“第几声咔哒”，而是按时间就近配对，
+        // 这样漏掉第一声也不会整体错 500ms
+        var deltas: [Double] = []
+        for onset in onsets {
+            guard let nearest = Self.clickTimes.min(by: { abs($0 - onset) < abs($1 - onset) }),
+                  abs(onset - nearest) < 0.45 else { continue }
+            deltas.append(onset - nearest)
+        }
+        guard !deltas.isEmpty else {
+            finish(.failure(MeasureError.noSignal))
+            return
+        }
+
+        deltas.sort()
+        let median = deltas[deltas.count / 2]
 
         // 扣掉麦克风输入链路的固定延迟
         let inputLatency = min(AVAudioSession.sharedInstance().inputLatency, 0.1)
-        let ms = max(0, raw - inputLatency) * 1000
+        let ms = (median - inputLatency) * 1000
 
-        // 如果三次起音间隔明显不是 0.5s，说明抓到的是噪声
-        if onsets.count >= 2 {
-            let gap = onsets[1] - onsets[0]
-            if abs(gap - 0.5) > 0.12 {
-                Log.write("calibration suspicious: gap \(gap)")
-                finish(.failure(MeasureError.noSignal))
-                return
-            }
-        }
-
-        if ms < 10 || ms > 600 {
+        if ms < 20 || ms > 400 {
             finish(.failure(MeasureError.outOfRange(ms)))
         } else {
-            finish(.success(ms.rounded()))
+            // 测到的是“声音晚到多少”，对应的操作是让画面后移，所以取负
+            finish(.success(-ms.rounded()))
         }
     }
 
@@ -1730,7 +1734,8 @@ extension CompensateViewController {
                 self.refresh()
                 OffsetStore.current = ms
                 Log.write("calibrated \(Int(ms))ms on \(OffsetStore.routeName)")
-                self.statusLabel.text = String(format: "测量完成：%.0f ms · 已保存到「%@」", ms, OffsetStore.routeName)
+                let direction = ms < 0 ? "画面后移" : "音频后移"
+                self.statusLabel.text = String(format: "测量完成：%.0f ms（%@）· 已保存到「%@」", ms, direction, OffsetStore.routeName)
             case .failure(let error):
                 Log.write("calibration failed: \(error.localizedDescription)")
                 self.statusLabel.text = "测量失败：\(error.localizedDescription)"
