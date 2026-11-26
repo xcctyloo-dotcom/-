@@ -1,5 +1,6 @@
 import AVFoundation
 import CarPlay
+import PhotosUI
 import MediaPlayer
 import UIKit
 import UniformTypeIdentifiers
@@ -890,7 +891,8 @@ final class CompensateViewController: UIViewController {
 
         [help, valueLabel, slider, presetRow,
          makeButton("自动测量延迟", #selector(measureTapped)),
-         makeButton("选择视频（可多选）", #selector(pickVideo)),
+         makeButton("从相册选择（可多选）", #selector(pickFromPhotos)),
+         makeButton("从文件选择（可多选）", #selector(pickVideo)),
          exportButton, progressBar, statusLabel, shareButton].forEach { stack.addArrangedSubview($0) }
         view.addSubview(stack)
 
@@ -1123,21 +1125,7 @@ final class CompensateViewController: UIViewController {
 extension CompensateViewController: UIDocumentPickerDelegate {
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         guard !urls.isEmpty else { return }
-
-        sources = urls
-        sourceSizes = urls.map { url in
-            Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-        }
-        lastExport = nil
-        shareButton.isHidden = true
-
-        let total = sourceSizes.reduce(0, +)
-        if urls.count > 1 {
-            statusLabel.text = "已选 \(urls.count) 个 · 共 \(Format.bytes(total))"
-        } else {
-            statusLabel.text = "已选：\(urls[0].lastPathComponent) · \(Format.bytes(total))"
-        }
-        refresh()
+        applySelection(urls)
     }
 }
 
@@ -1512,29 +1500,45 @@ enum ClickFile {
 
 enum AudioAnalysis {
 
-    /// 返回录音里第一次超过阈值的时间点（秒）
-    static func firstOnset(fileURL: URL) -> Double? {
-        guard let file = try? AVAudioFile(forReading: fileURL) else { return nil }
+    /// 返回所有“起音”的时间点（秒），带最小间隔去抖
+    static func onsets(fileURL: URL, minGap: Double = 0.2) -> [Double] {
+        guard let file = try? AVAudioFile(forReading: fileURL) else { return [] }
         let format = file.processingFormat
         let frames = AVAudioFrameCount(file.length)
         guard frames > 0,
-              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return nil }
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return [] }
         guard (try? file.read(into: buffer)) != nil,
-              let channel = buffer.floatChannelData?[0] else { return nil }
+              let channel = buffer.floatChannelData?[0] else { return [] }
 
         let count = Int(buffer.frameLength)
-        var run = 0
+        var peak: Float = 0
         for i in 0..<count {
-            if abs(channel[i]) > 0.06 {
+            let value = abs(channel[i])
+            if value > peak { peak = value }
+        }
+        guard peak > 0.02 else { return [] }
+
+        let threshold = max(0.05, peak * 0.25)
+        var result: [Double] = []
+        var run = 0
+        var lastTime = -1.0
+
+        for i in 0..<count {
+            if abs(channel[i]) > threshold {
                 run += 1
                 if run >= 3 {
-                    return Double(i - 2) / format.sampleRate
+                    let time = Double(i - 2) / format.sampleRate
+                    if time - lastTime > minGap {
+                        result.append(time)
+                        lastTime = time
+                    }
+                    run = 0
                 }
             } else {
                 run = 0
             }
         }
-        return nil
+        return result
     }
 }
 
@@ -1544,26 +1548,32 @@ final class Calibrator {
 
     static let shared = Calibrator()
 
+    /// 三次咔哒的起播时间（相对录音开始）
+    private static let clickTimes: [Double] = [0.35, 0.85, 1.35]
+
     enum MeasureError: LocalizedError {
         case noPermission
         case busy
         case noSignal
+        case notCarPlay(String)
         case outOfRange(Double)
 
         var errorDescription: String? {
             switch self {
             case .noPermission: return "没有麦克风权限，去设置里允许"
             case .busy: return "录音启动失败，可能被别的 App 占用"
-            case .noSignal: return "没听到咔哒声，检查车机音量或换个安静环境"
-            case .outOfRange(let ms): return String(format: "测到 %.0f ms，明显不对，建议手动调", ms)
+            case .noSignal: return "没听到咔哒声，检查车机音量，或换个安静环境"
+            case .notCarPlay(let name):
+                return "当前输出是「\(name)」，不是车机。先连上 CarPlay 再测"
+            case .outOfRange(let ms):
+                return String(format: "测到 %.0f ms，明显不对，建议手动调", ms)
             }
         }
     }
 
     private var recorder: AVAudioRecorder?
-    private var player: AVAudioPlayer?
+    private var players: [AVAudioPlayer] = []
     private var startedAt: Date?
-    private var clickAt: Date?
     private var completion: ((Result<Double, Error>) -> Void)?
 
     private init() {}
@@ -1590,7 +1600,8 @@ final class Calibrator {
     private func start() {
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playAndRecord, mode: .default,
+            // .measurement 关掉系统输入处理，避免 AGC / 降噪改变时序
+            try session.setCategory(.playAndRecord, mode: .measurement,
                                     options: [.defaultToSpeaker, .allowBluetoothA2DP])
             try session.setActive(true)
         } catch {
@@ -1598,13 +1609,23 @@ final class Calibrator {
             return
         }
 
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cal.m4a")
+        let output = session.currentRoute.outputs.first
+        guard output?.portType == .carAudio else {
+            finish(.failure(MeasureError.notCarPlay(output?.portName ?? "手机扬声器")))
+            return
+        }
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("cal.wav")
         try? FileManager.default.removeItem(at: url)
+
+        // PCM/WAV：没有编码器延迟，时间点才是准的
         let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVFormatIDKey: Int(kAudioFormatLinearPCM),
             AVSampleRateKey: 44100.0,
             AVNumberOfChannelsKey: 1,
-            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false
         ]
 
         guard let recorder = try? AVAudioRecorder(url: url, settings: settings) else {
@@ -1616,18 +1637,24 @@ final class Calibrator {
             finish(.failure(MeasureError.busy))
             return
         }
-
         startedAt = Date()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            guard let self else { return }
-            self.clickAt = Date()
-            if let clickURL = ClickFile.url() {
-                self.player = try? AVAudioPlayer(contentsOf: clickURL)
-                self.player?.play()
+
+        guard let clickURL = ClickFile.url() else {
+            finish(.failure(MeasureError.noSignal))
+            return
+        }
+
+        for time in Self.clickTimes {
+            DispatchQueue.main.asyncAfter(deadline: .now() + time) {
+                if let player = try? AVAudioPlayer(contentsOf: clickURL) {
+                    player.play()
+                    self.players.append(player)
+                }
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                self?.stopAndAnalyze()
-            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.stopAndAnalyze()
         }
     }
 
@@ -1636,19 +1663,35 @@ final class Calibrator {
         recorder?.stop()
         recorder = nil
 
-        guard let url,
-              let clickAt,
-              let startedAt,
-              let onset = AudioAnalysis.firstOnset(fileURL: url) else {
+        guard let url, startedAt != nil else {
             finish(.failure(MeasureError.noSignal))
             return
         }
 
-        let clickOffset = clickAt.timeIntervalSince(startedAt)
-        // 麦克风采集和播放启动有约 10ms 固定开销，扣掉
-        let ms = ((onset - clickOffset) - 0.01) * 1000
+        let onsets = AudioAnalysis.onsets(fileURL: url)
+        guard let firstOnset = onsets.first else {
+            finish(.failure(MeasureError.noSignal))
+            return
+        }
 
-        if ms < 15 || ms > 800 {
+        // 用第一次咔哒对齐
+        let raw = firstOnset - Self.clickTimes[0]
+
+        // 扣掉麦克风输入链路的固定延迟
+        let inputLatency = min(AVAudioSession.sharedInstance().inputLatency, 0.1)
+        let ms = max(0, raw - inputLatency) * 1000
+
+        // 如果三次起音间隔明显不是 0.5s，说明抓到的是噪声
+        if onsets.count >= 2 {
+            let gap = onsets[1] - onsets[0]
+            if abs(gap - 0.5) > 0.12 {
+                Log.write("calibration suspicious: gap \(gap)")
+                finish(.failure(MeasureError.noSignal))
+                return
+            }
+        }
+
+        if ms < 10 || ms > 600 {
             finish(.failure(MeasureError.outOfRange(ms)))
         } else {
             finish(.success(ms.rounded()))
@@ -1656,8 +1699,8 @@ final class Calibrator {
     }
 
     private func finish(_ result: Result<Double, Error>) {
-        player?.stop()
-        player = nil
+        players.forEach { $0.stop() }
+        players.removeAll()
         recorder = nil
 
         let session = AVAudioSession.sharedInstance()
@@ -1677,7 +1720,7 @@ extension CompensateViewController {
     @objc fileprivate func measureTapped() {
         guard !exporting else { return }
 
-        statusLabel.text = "测量中：保持安静，车里会响一声"
+        statusLabel.text = "测量中：保持安静，车里会响三声"
         Calibrator.shared.measure { [weak self] result in
             guard let self else { return }
             switch result {
@@ -1693,5 +1736,79 @@ extension CompensateViewController {
                 self.statusLabel.text = "测量失败：\(error.localizedDescription)"
             }
         }
+    }
+}
+
+// MARK: - 从相册导入
+
+extension CompensateViewController: PHPickerViewControllerDelegate {
+
+    @objc fileprivate func pickFromPhotos() {
+        guard !exporting else { return }
+        var config = PHPickerConfiguration()
+        config.filter = .videos
+        config.selectionLimit = 0
+        config.preferredAssetRepresentationMode = .current
+
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = self
+        present(picker, animated: true)
+    }
+
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+
+        let providers = results.map { $0.itemProvider }
+            .filter { $0.hasItemConformingToTypeIdentifier(UTType.movie.identifier) }
+        guard !providers.isEmpty else { return }
+
+        statusLabel.text = "正在从相册导入 \(providers.count) 个…"
+        importProviders(providers, index: 0, collected: [])
+    }
+
+    private func importProviders(_ providers: [NSItemProvider], index: Int, collected: [URL]) {
+        guard index < providers.count else {
+            applySelection(collected)
+            return
+        }
+
+        let provider = providers[index]
+        provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { [weak self] url, _ in
+            var copied: URL?
+            if let url {
+                let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
+                let dst = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString + "." + ext)
+                try? FileManager.default.removeItem(at: dst)
+                if (try? FileManager.default.copyItem(at: url, to: dst)) != nil {
+                    copied = dst
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                var next = collected
+                if let copied { next.append(copied) }
+                self.importProviders(providers, index: index + 1, collected: next)
+            }
+        }
+    }
+
+    fileprivate func applySelection(_ urls: [URL]) {
+        sources = urls
+        sourceSizes = urls.map { url in
+            Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+        lastExport = nil
+        shareButton.isHidden = true
+
+        let total = sourceSizes.reduce(0, +)
+        if urls.count > 1 {
+            statusLabel.text = "已选 \(urls.count) 个 · 共 \(Format.bytes(total))"
+        } else if let first = urls.first {
+            statusLabel.text = "已选：\(first.lastPathComponent) · \(Format.bytes(total))"
+        } else {
+            statusLabel.text = "没选到视频"
+        }
+        refresh()
     }
 }
