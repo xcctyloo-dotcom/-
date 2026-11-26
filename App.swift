@@ -128,10 +128,10 @@ final class MenuViewController: UIViewController {
         }
 
         addSection("给车机播放器用（CarMovie 等）")
-        addCard("补偿版导出", "把音画偏移焊进文件，导出可直接播的 MP4") { [weak self] in
+        addCard("补偿版导出", "可批量：同一偏移排队导出多个视频") { [weak self] in
             self?.navigationController?.pushViewController(CompensateViewController(), animated: true)
         }
-        addCard("已导出文件", "查看、分享、删除导出的视频") { [weak self] in
+        addCard("已导出文件", "批量选择、分享、删除导出的视频") { [weak self] in
             self?.navigationController?.pushViewController(ExportedFilesViewController(), animated: true)
         }
 
@@ -807,18 +807,22 @@ final class CompensateViewController: UIViewController {
     private let slider = UISlider()
     private let progressBar = UIProgressView(progressViewStyle: .default)
 
-    private var source: URL?
-    private var sourceSize: Int64 = 0
+    private var sources: [URL] = []
+    private var sourceSizes: [Int64] = []
     private var offsetMs: Double = 120
     private var exporting = false
+    private var cancelling = false
     private var startedAt: Date?
+    private var completed = 0
+    private var failed = 0
+    private var currentIndex = 0
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
     private var actionButton: UIButton?
     private var lastExport: URL?
 
     private lazy var shareButton: UIButton = {
         var config = UIButton.Configuration.tinted()
-        config.title = "分享这份文件"
+        config.title = "分享最后一份"
         config.cornerStyle = .medium
         let button = UIButton(configuration: config)
         button.addAction(UIAction { [weak self] _ in self?.presentShare() }, for: .touchUpInside)
@@ -835,6 +839,8 @@ final class CompensateViewController: UIViewController {
         buildUI()
     }
 
+    // MARK: UI
+
     private func buildUI() {
         let help = UILabel()
         help.numberOfLines = 0
@@ -845,7 +851,8 @@ final class CompensateViewController: UIViewController {
         · 先听到声、后看到动作 → 声音偏早，用正值（音频后移）
         · 先看到动作、后听到声 → 声音偏晚，用负值（画面后移）
 
-        导出后用 CarMovie 打开那份新文件即可。
+        可以一次选多个视频，用同一个偏移排队导出。
+        导出期间请留在本页：iOS 只给约 30 秒后台时间。
         """
 
         valueLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
@@ -863,15 +870,6 @@ final class CompensateViewController: UIViewController {
         statusLabel.textColor = .secondaryLabel
         statusLabel.numberOfLines = 0
 
-        let exportButton = makeButton("导出补偿版", #selector(runExport))
-        actionButton = exportButton
-
-        stack.axis = .vertical
-        stack.spacing = 14
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.isLayoutMarginsRelativeArrangement = true
-        stack.layoutMargins = UIEdgeInsets(top: 0, left: 20, bottom: 20, right: 20)
-
         let presetRow = UIStackView(arrangedSubviews: [
             makePresetButton("−100", -100),
             makePresetButton("0", 0),
@@ -883,10 +881,18 @@ final class CompensateViewController: UIViewController {
         presetRow.distribution = .fillEqually
         presetRow.spacing = 6
 
+        let exportButton = makeButton("导出补偿版", #selector(runExport))
+        actionButton = exportButton
         shareButton.isHidden = true
 
+        stack.axis = .vertical
+        stack.spacing = 14
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.isLayoutMarginsRelativeArrangement = true
+        stack.layoutMargins = UIEdgeInsets(top: 0, left: 20, bottom: 20, right: 20)
+
         [help, valueLabel, slider, presetRow,
-         makeButton("选择视频", #selector(pickVideo)),
+         makeButton("选择视频（可多选）", #selector(pickVideo)),
          exportButton, progressBar, statusLabel, shareButton].forEach { stack.addArrangedSubview($0) }
         view.addSubview(stack)
 
@@ -903,9 +909,17 @@ final class CompensateViewController: UIViewController {
         var config = UIButton.Configuration.filled()
         config.title = title
         config.cornerStyle = .medium
-        let b = UIButton(configuration: config)
-        b.addTarget(self, action: action, for: .touchUpInside)
-        return b
+        let button = UIButton(configuration: config)
+        button.addTarget(self, action: action, for: .touchUpInside)
+        return button
+    }
+
+    private func makePresetButton(_ title: String, _ value: Double) -> UIButton {
+        let button = UIButton(type: .system)
+        button.setTitle(title, for: .normal)
+        button.titleLabel?.font = .systemFont(ofSize: 13, weight: .medium)
+        button.addAction(UIAction { [weak self] _ in self?.applyPreset(value) }, for: .touchUpInside)
+        return button
     }
 
     private func setActionTitle(_ title: String) {
@@ -916,6 +930,10 @@ final class CompensateViewController: UIViewController {
     private func refresh() {
         let direction = offsetMs > 0 ? "音频后移" : (offsetMs < 0 ? "画面后移" : "不偏移")
         valueLabel.text = String(format: "%+.0f ms · %@", offsetMs, direction)
+
+        if !exporting {
+            setActionTitle(sources.count > 1 ? "导出补偿版（\(sources.count) 个）" : "导出补偿版")
+        }
     }
 
     @objc private func sliderChanged() {
@@ -924,19 +942,33 @@ final class CompensateViewController: UIViewController {
         UserDefaults.standard.set(offsetMs, forKey: "exportOffsetMs")
     }
 
+    private func applyPreset(_ value: Double) {
+        offsetMs = value
+        slider.value = Float(value)
+        refresh()
+        UserDefaults.standard.set(value, forKey: "exportOffsetMs")
+    }
+
+    // MARK: 选视频
+
     @objc private func pickVideo() {
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.movie], asCopy: true)
         picker.delegate = self
+        picker.allowsMultipleSelection = true
         present(picker, animated: true)
     }
 
+    // MARK: 导出
+
     @objc private func runExport() {
         if exporting {
+            cancelling = true
             CompensateExporter.cancel()
+            statusLabel.text = "正在取消…"
             return
         }
-        guard let source else {
-            statusLabel.text = "先选一个视频"
+        guard !sources.isEmpty else {
+            statusLabel.text = "先选视频"
             return
         }
         guard abs(offsetMs) >= 1 else {
@@ -944,7 +976,8 @@ final class CompensateViewController: UIViewController {
             return
         }
 
-        let needed = sourceSize == 0 ? 0 : Int64(Double(sourceSize) * 1.2)
+        let totalSource = sourceSizes.reduce(0, +)
+        let needed = Int64(Double(totalSource) * 1.2)
         let free = CompensateExporter.freeSpace()
         if free > 0 && free < needed {
             statusLabel.text = "空间不足：需要约 \(Format.bytes(needed))，可用 \(Format.bytes(free))"
@@ -959,64 +992,111 @@ final class CompensateViewController: UIViewController {
                                           preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "先不导", style: .cancel))
             alert.addAction(UIAlertAction(title: "继续", style: .default) { [weak self] _ in
-                self?.startExport(source: source)
+                self?.startQueue()
             })
             present(alert, animated: true)
             return
         }
 
-        startExport(source: source)
+        startQueue()
     }
 
-    private func startExport(source: URL) {
+    private func startQueue() {
         exporting = true
+        cancelling = false
+        completed = 0
+        failed = 0
+        currentIndex = 0
+        lastExport = nil
         startedAt = Date()
         shareButton.isHidden = true
         progressBar.isHidden = false
         progressBar.progress = 0
         setActionTitle("取消")
-        statusLabel.text = "准备中…"
+        statusLabel.text = sources.count > 1 ? "准备中…共 \(sources.count) 个" : "准备中…"
 
         UIApplication.shared.isIdleTimerDisabled = true
         bgTask = UIApplication.shared.beginBackgroundTask { [weak self] in
             self?.endBackground()
         }
 
-        CompensateExporter.export(source: source, offsetMs: offsetMs, progress: { [weak self] p in
-            self?.updateProgress(p)
+        runNext()
+    }
+
+    private func runNext() {
+        guard currentIndex < sources.count else {
+            finishQueue()
+            return
+        }
+
+        let url = sources[currentIndex]
+        CompensateExporter.export(source: url, offsetMs: offsetMs, progress: { [weak self] p in
+            guard let self else { return }
+            let overall = (Double(self.completed + self.failed) + p) / Double(max(1, self.sources.count))
+            self.updateProgress(overall: overall, current: p)
         }, completion: { [weak self] result in
             guard let self else { return }
-            self.exporting = false
-            self.setActionTitle("导出补偿版")
-            self.progressBar.isHidden = true
-            UIApplication.shared.isIdleTimerDisabled = false
-            self.endBackground()
+
+            if self.cancelling {
+                self.finishQueue()
+                return
+            }
 
             switch result {
-            case .success(let url):
-                self.lastExport = url
-                self.shareButton.isHidden = false
-                let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-                self.statusLabel.text = "完成 · \(Format.bytes(size))\n\(url.lastPathComponent)\n位置：文件 App → CarPlayCast"
-            case .failure(let error):
-                self.statusLabel.text = error.localizedDescription
+            case .success(let output):
+                self.completed += 1
+                self.lastExport = output
+            case .failure:
+                self.failed += 1
             }
+
+            self.currentIndex += 1
+            self.runNext()
         })
     }
 
-    private func makePresetButton(_ title: String, _ value: Double) -> UIButton {
-        let button = UIButton(type: .system)
-        button.setTitle(title, for: .normal)
-        button.titleLabel?.font = .systemFont(ofSize: 13, weight: .medium)
-        button.addAction(UIAction { [weak self] _ in self?.applyPreset(value) }, for: .touchUpInside)
-        return button
+    private func finishQueue() {
+        exporting = false
+        let wasCancelled = cancelling
+        cancelling = false
+        setActionTitle("导出补偿版")
+        progressBar.isHidden = true
+        UIApplication.shared.isIdleTimerDisabled = false
+        endBackground()
+
+        if let lastExport {
+            shareButton.isHidden = false
+            let size = Int64((try? lastExport.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            if sources.count > 1 {
+                statusLabel.text = "完成 \(completed) 个，失败 \(failed) 个\(wasCancelled ? "（已取消）" : "")\n最后一份 \(Format.bytes(size)) · 文件 App → CarPlayCast"
+            } else {
+                statusLabel.text = "完成 · \(Format.bytes(size))\n\(lastExport.lastPathComponent)\n位置：文件 App → CarPlayCast"
+            }
+        } else if sources.count > 1 {
+            statusLabel.text = "完成 \(completed) 个，失败 \(failed) 个\(wasCancelled ? "（已取消）" : "")"
+        } else {
+            statusLabel.text = wasCancelled ? "已取消" : "导出失败"
+        }
     }
 
-    private func applyPreset(_ value: Double) {
-        offsetMs = value
-        slider.value = Float(value)
-        refresh()
-        UserDefaults.standard.set(value, forKey: "exportOffsetMs")
+    private func updateProgress(overall: Double, current: Double) {
+        progressBar.setProgress(Float(min(max(overall, 0), 1)), animated: true)
+
+        var text: String
+        if sources.count > 1 {
+            text = "第 \(min(currentIndex + 1, sources.count))/\(sources.count) 个 · \(Int(current * 100))%"
+        } else {
+            text = "\(Int(current * 100))%"
+        }
+
+        if overall > 0.03, let startedAt {
+            let elapsed = Date().timeIntervalSince(startedAt)
+            let total = elapsed / overall
+            text += " · 预计还需 " + Format.duration(max(0, total - elapsed))
+        } else {
+            text += " · 估算中…"
+        }
+        statusLabel.text = text
     }
 
     private func presentShare() {
@@ -1033,21 +1113,6 @@ final class CompensateViewController: UIViewController {
         return level < 0.2 && UIDevice.current.batteryState != .charging
     }
 
-    private func updateProgress(_ p: Double) {
-        let value = min(max(p, 0), 1)
-        progressBar.setProgress(Float(value), animated: true)
-
-        var text = "\(Int(value * 100))%"
-        if value > 0.03, let startedAt {
-            let elapsed = Date().timeIntervalSince(startedAt)
-            let total = elapsed / value
-            text += " · 预计还需 " + Format.duration(max(0, total - elapsed))
-        } else {
-            text += " · 估算中…"
-        }
-        statusLabel.text = text
-    }
-
     private func endBackground() {
         if bgTask != .invalid {
             UIApplication.shared.endBackgroundTask(bgTask)
@@ -1058,16 +1123,22 @@ final class CompensateViewController: UIViewController {
 
 extension CompensateViewController: UIDocumentPickerDelegate {
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        guard let url = urls.first else { return }
-        let dst = FileManager.default.temporaryDirectory
-            .appendingPathComponent("source.\(url.pathExtension.isEmpty ? "mp4" : url.pathExtension)")
-        try? FileManager.default.removeItem(at: dst)
-        try? FileManager.default.copyItem(at: url, to: dst)
-        source = dst
+        guard !urls.isEmpty else { return }
 
-        let size = Int64((try? dst.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-        sourceSize = size
-        statusLabel.text = "已选择：\(url.lastPathComponent) · \(Format.bytes(size))"
+        sources = urls
+        sourceSizes = urls.map { url in
+            Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+        lastExport = nil
+        shareButton.isHidden = true
+
+        let total = sourceSizes.reduce(0, +)
+        if urls.count > 1 {
+            statusLabel.text = "已选 \(urls.count) 个 · 共 \(Format.bytes(total))"
+        } else {
+            statusLabel.text = "已选：\(urls[0].lastPathComponent) · \(Format.bytes(total))"
+        }
+        refresh()
     }
 }
 
@@ -1076,24 +1147,40 @@ extension CompensateViewController: UIDocumentPickerDelegate {
 final class ExportedFilesViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
 
     private let table = UITableView(frame: .zero, style: .insetGrouped)
+    private let bar = UIStackView()
+    private let selectAllButton = UIButton(type: .system)
+    private let shareButton = UIButton(type: .system)
+    private let deleteButton = UIButton(type: .system)
     private var files: [URL] = []
+    private var selecting = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "已导出"
         view.backgroundColor = .systemGroupedBackground
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "选择", style: .plain,
+                                                            target: self,
+                                                            action: #selector(toggleSelecting))
 
         table.dataSource = self
         table.delegate = self
+        table.allowsMultipleSelectionDuringEditing = true
         table.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
         table.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(table)
 
+        buildBar()
+
         NSLayoutConstraint.activate([
-            table.topAnchor.constraint(equalTo: view.topAnchor),
+            table.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             table.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             table.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            table.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            table.bottomAnchor.constraint(equalTo: bar.topAnchor),
+
+            bar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            bar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            bar.heightAnchor.constraint(equalToConstant: 52)
         ])
     }
 
@@ -1101,6 +1188,98 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         super.viewWillAppear(animated)
         reload()
     }
+
+    // MARK: 底栏
+
+    private func buildBar() {
+        bar.axis = .horizontal
+        bar.distribution = .fillEqually
+        bar.backgroundColor = .secondarySystemGroupedBackground
+        bar.translatesAutoresizingMaskIntoConstraints = false
+
+        let items: [(UIButton, String, Selector)] = [
+            (selectAllButton, "全选", #selector(toggleSelectAll)),
+            (shareButton, "分享", #selector(shareSelected)),
+            (deleteButton, "删除", #selector(deleteSelected))
+        ]
+        for (button, title, action) in items {
+            button.setTitle(title, for: .normal)
+            button.titleLabel?.font = .systemFont(ofSize: 15, weight: .medium)
+            button.addTarget(self, action: action, for: .touchUpInside)
+            bar.addArrangedSubview(button)
+        }
+        deleteButton.tintColor = .systemRed
+
+        view.addSubview(bar)
+        updateBar()
+    }
+
+    private func updateBar() {
+        let count = table.indexPathsForSelectedRows?.count ?? 0
+        let enabled = selecting && count > 0
+        shareButton.isEnabled = enabled
+        deleteButton.isEnabled = enabled
+        selectAllButton.isEnabled = selecting
+        shareButton.setTitle(count > 1 ? "分享 (\(count))" : "分享", for: .normal)
+        deleteButton.setTitle(count > 1 ? "删除 (\(count))" : "删除", for: .normal)
+    }
+
+    @objc private func toggleSelecting() {
+        selecting.toggle()
+        table.setEditing(selecting, animated: true)
+        navigationItem.rightBarButtonItem?.title = selecting ? "完成" : "选择"
+        if !selecting { table.deselectAll(animated: false) }
+        table.reloadData()
+        updateBar()
+    }
+
+    @objc private func toggleSelectAll() {
+        guard selecting else { return }
+        let allSelected = (table.indexPathsForSelectedRows?.count ?? 0) == files.count
+        if allSelected {
+            table.deselectAll(animated: false)
+        } else {
+            for row in files.indices {
+                table.selectRow(at: IndexPath(row: row, section: 0), animated: false, scrollPosition: .none)
+            }
+        }
+        updateBar()
+    }
+
+    private func selectedURLs() -> [URL] {
+        let rows = (table.indexPathsForSelectedRows ?? []).sorted { $0.row < $1.row }
+        return rows.compactMap { files.indices.contains($0.row) ? files[$0.row] : nil }
+    }
+
+    @objc private func shareSelected() {
+        let urls = selectedURLs()
+        guard !urls.isEmpty else { return }
+        let controller = UIActivityViewController(activityItems: urls, applicationActivities: nil)
+        controller.popoverPresentationController?.sourceView = bar
+        present(controller, animated: true)
+    }
+
+    @objc private func deleteSelected() {
+        let urls = selectedURLs()
+        guard !urls.isEmpty else { return }
+
+        let alert = UIAlertController(title: "删除 \(urls.count) 个文件？",
+                                      message: "删了就找不回来了",
+                                      preferredStyle: .actionSheet)
+        alert.addAction(UIAlertAction(title: "删除", style: .destructive) { [weak self] _ in
+            guard let self else { return }
+            urls.forEach { try? FileManager.default.removeItem(at: $0) }
+            self.selecting = false
+            self.table.setEditing(false, animated: true)
+            self.navigationItem.rightBarButtonItem?.title = "选择"
+            self.reload()
+        })
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        alert.popoverPresentationController?.sourceView = bar
+        present(alert, animated: true)
+    }
+
+    // MARK: 数据
 
     private func reload() {
         let dir = CompensateExporter.documentsDir()
@@ -1113,7 +1292,10 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
                 return da > db
             }
         table.reloadData()
+        updateBar()
     }
+
+    // MARK: UITableView
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
         files.count
@@ -1127,11 +1309,15 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
         content.secondaryText = Format.bytes(size)
         cell.contentConfiguration = content
-        cell.accessoryType = .disclosureIndicator
+        cell.accessoryType = selecting ? .none : .disclosureIndicator
         return cell
     }
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        if selecting {
+            updateBar()
+            return
+        }
         tableView.deselectRow(at: indexPath, animated: true)
         let url = files[indexPath.row]
         let share = UIActivityViewController(activityItems: [url], applicationActivities: nil)
@@ -1140,8 +1326,13 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         present(share, animated: true)
     }
 
+    func tableView(_ tableView: UITableView, didDeselectRowAt indexPath: IndexPath) {
+        updateBar()
+    }
+
     func tableView(_ tableView: UITableView,
                    trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        guard !selecting else { return nil }
         let delete = UIContextualAction(style: .destructive, title: "删除") { [weak self] _, _, done in
             guard let self else { return done(false) }
             try? FileManager.default.removeItem(at: self.files[indexPath.row])
@@ -1149,11 +1340,6 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
             done(true)
         }
         return UISwipeActionsConfiguration(actions: [delete])
-    }
-
-    override func setEditing(_ editing: Bool, animated: Bool) {
-        super.setEditing(editing, animated: animated)
-        table.setEditing(editing, animated: animated)
     }
 }
 
