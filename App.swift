@@ -10,9 +10,30 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "3.9"
-    static let note = "skip-detail"
+    static let version = "4.0"
+    static let note = "ui"
     static var display: String { "v\(version) · \(note)" }
+}
+
+// MARK: - 视觉
+
+enum Theme {
+    static let accent = UIColor.systemTeal
+    static let card = UIColor.secondarySystemGroupedBackground
+    static let corner: CGFloat = 16
+    static let padding: CGFloat = 16
+}
+
+enum Haptics {
+    static func tap() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+    static func success() {
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+    }
+    static func failure() {
+        UINotificationFeedbackGenerator().notificationOccurred(.error)
+    }
 }
 
 // MARK: - 工具
@@ -130,28 +151,28 @@ final class MenuViewController: UIViewController {
 
     private func build() {
         addSection("车机")
-        addCard("车载播放", "车机主屏出现「车载播放」列表，播放测试音") { [weak self] in
+        addCard("车载播放", "车机主屏出现「车载播放」列表，播放测试音", "car.fill") { [weak self] in
             self?.showAlert("插上 CarPlay 后，车机主屏会出现「车载播放」。\n\n如果没出现，是 CarPlay 权限没被系统认，和代码无关。")
         }
 
         addSection("手机播放 · 声音走车机")
-        addCard("视频同步", "画面在手机，声音走车机，可调音画偏移") { [weak self] in
+        addCard("视频同步", "画面在手机，声音走车机，可调音画偏移", "rectangle.on.rectangle") { [weak self] in
             self?.navigationController?.pushViewController(VideoSyncViewController(), animated: true)
         }
 
         addSection("给车机播放器用（CarMovie 等）")
-        addCard("补偿版导出", "可批量：同一偏移排队导出多个视频") { [weak self] in
+        addCard("补偿版导出", "可批量：同一偏移排队导出多个视频", "wand.and.stars") { [weak self] in
             self?.navigationController?.pushViewController(CompensateViewController(), animated: true)
         }
-        addCard("本地播放（免导入）", "起本地链接，CarMovie 按 URL 直接播") { [weak self] in
+        addCard("本地播放（免导入）", "起本地链接，CarMovie 按 URL 直接播", "antenna.radiowaves.left.and.right") { [weak self] in
             self?.navigationController?.pushViewController(LocalServerViewController(), animated: true)
         }
-        addCard("已导出文件", "批量选择、分享、删除导出的视频") { [weak self] in
+        addCard("已导出文件", "批量选择、分享、删除导出的视频", "folder.fill") { [weak self] in
             self?.navigationController?.pushViewController(ExportedFilesViewController(), animated: true)
         }
 
         addSection("说明")
-        addCard("这个 App 能做什么", "三种模式的区别与各自的上限") { [weak self] in
+        addCard("这个 App 能做什么", "三种模式的区别与各自的上限", "questionmark.circle") { [weak self] in
             self?.navigationController?.pushViewController(AboutViewController(), animated: true)
         }
 
@@ -174,19 +195,31 @@ final class MenuViewController: UIViewController {
         stack.addArrangedSubview(box)
     }
 
-    private func addCard(_ title: String, _ subtitle: String, _ action: @escaping () -> Void) {
+    private func addCard(_ title: String,
+                         _ subtitle: String,
+                         _ symbol: String,
+                         _ action: @escaping () -> Void) {
         var config = UIButton.Configuration.filled()
         config.title = title
         config.subtitle = subtitle
+        config.image = UIImage(systemName: symbol)
+        config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+        config.imagePadding = 12
+        config.imagePlacement = .leading
         config.cornerStyle = .large
-        config.baseBackgroundColor = .secondarySystemGroupedBackground
+        config.baseBackgroundColor = Theme.card
         config.baseForegroundColor = .label
-        config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16)
+        config.contentInsets = NSDirectionalEdgeInsets(top: 16, leading: 16, bottom: 16, trailing: 16)
         config.titleAlignment = .leading
 
         let button = UIButton(configuration: config)
         button.contentHorizontalAlignment = .leading
-        button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+        button.tintColor = Theme.accent
+        button.layer.cornerRadius = Theme.corner
+        button.addAction(UIAction { _ in
+            Haptics.tap()
+            action()
+        }, for: .touchUpInside)
         stack.addArrangedSubview(button)
     }
 
@@ -876,6 +909,7 @@ final class CompensateViewController: UIViewController {
     private var importTimeout: DispatchWorkItem?
     private var importAborted = false
     private var importFailureNames: [String] = []
+    private var presetButtons: [(button: UIButton, value: Double)] = []
     private var overwriteCount = 0
 
     private lazy var shareButton: UIButton = {
@@ -915,7 +949,8 @@ final class CompensateViewController: UIViewController {
         导出期间请留在本页：iOS 只给约 30 秒后台时间。
         """
 
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 18, weight: .semibold)
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 40, weight: .bold)
+        valueLabel.textColor = Theme.accent
         valueLabel.textAlignment = .center
 
         slider.minimumValue = -400
@@ -975,7 +1010,9 @@ final class CompensateViewController: UIViewController {
     private func makeButton(_ title: String, _ action: Selector) -> UIButton {
         var config = UIButton.Configuration.filled()
         config.title = title
-        config.cornerStyle = .medium
+        config.cornerStyle = .large
+        config.baseBackgroundColor = Theme.accent
+        config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16)
         let button = UIButton(configuration: config)
         button.addTarget(self, action: action, for: .touchUpInside)
         return button
@@ -1016,10 +1053,19 @@ final class CompensateViewController: UIViewController {
     }
 
     private func makePresetButton(_ title: String, _ value: Double) -> UIButton {
-        let button = UIButton(type: .system)
-        button.setTitle(title, for: .normal)
-        button.titleLabel?.font = .systemFont(ofSize: 13, weight: .medium)
-        button.addAction(UIAction { [weak self] _ in self?.applyPreset(value) }, for: .touchUpInside)
+        var config = UIButton.Configuration.tinted()
+        config.title = title
+        config.cornerStyle = .capsule
+        config.baseBackgroundColor = Theme.accent
+        config.baseForegroundColor = Theme.accent
+        config.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10)
+
+        let button = UIButton(configuration: config)
+        button.addAction(UIAction { [weak self] _ in
+            Haptics.tap()
+            self?.applyPreset(value)
+        }, for: .touchUpInside)
+        presetButtons.append((button, value))
         return button
     }
 
@@ -1040,7 +1086,16 @@ final class CompensateViewController: UIViewController {
 
     private func refresh() {
         let direction = offsetMs > 0 ? "音频后移" : (offsetMs < 0 ? "画面后移" : "不偏移")
-        valueLabel.text = String(format: "%+.0f ms · %@", offsetMs, direction)
+        valueLabel.text = String(format: "%+.0f ms", offsetMs)
+        valueLabel.accessibilityLabel = String(format: "%.0f 毫秒，%@", offsetMs, direction)
+
+        for (button, value) in presetButtons {
+            var config = button.configuration
+            let selected = abs(value - offsetMs) < 0.5
+            config?.baseBackgroundColor = selected ? Theme.accent : Theme.card
+            config?.baseForegroundColor = selected ? .white : Theme.accent
+            button.configuration = config
+        }
 
         if !exporting {
             setActionTitle(sources.count > 1 ? "导出补偿版（\(sources.count) 个）" : "导出补偿版")
@@ -1233,6 +1288,16 @@ final class CompensateViewController: UIViewController {
         exporting = false
         let wasCancelled = cancelling
         cancelling = false
+
+        if !wasCancelled {
+            if completed > 0 && failed == 0 {
+                Haptics.success()
+            } else if completed == 0 {
+                Haptics.failure()
+            } else {
+                Haptics.tap()
+            }
+        }
         setActionTitle("导出补偿版")
         progressBar.isHidden = true
         UIApplication.shared.isIdleTimerDisabled = false
@@ -1495,6 +1560,9 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         let url = files[indexPath.row]
         var content = cell.defaultContentConfiguration()
         content.text = url.lastPathComponent
+        content.image = UIImage(systemName: "film")
+        content.imageProperties.tintColor = Theme.accent
+        content.imageProperties.maximumSize = CGSize(width: 22, height: 22)
         let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
         if let info = VideoInfoCache.cached(url) {
             content.secondaryText = info.summary + " · " + Format.bytes(size)
@@ -2719,6 +2787,7 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
         }
         let link = "http://127.0.0.1:\(LocalFileServer.shared.port)/playlist.m3u"
         UIPasteboard.general.string = link
+        Haptics.success()
         let alert = UIAlertController(title: "播放列表已复制",
                                       message: "\(link)\n\n在 CarMovie 里添加这一个链接，它会列出全部视频。",
                                       preferredStyle: .alert)
@@ -2748,6 +2817,9 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
 
         var content = cell.defaultContentConfiguration()
         content.text = file.lastPathComponent
+        content.image = UIImage(systemName: "link")
+        content.imageProperties.tintColor = Theme.accent
+        content.imageProperties.maximumSize = CGSize(width: 20, height: 20)
         if let link = LocalFileServer.shared.url(for: file) {
             content.secondaryText = link
             content.secondaryTextProperties.color = .systemBlue
@@ -2768,6 +2840,7 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
             return
         }
         UIPasteboard.general.string = link
+        Haptics.success()
         let alert = UIAlertController(title: "已复制", message: link, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "好", style: .default))
         present(alert, animated: true)
