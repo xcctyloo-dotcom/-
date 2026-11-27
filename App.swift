@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "3.4"
-    static let note = "remux-verified"
+    static let version = "3.5"
+    static let note = "scope-fix"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -452,40 +452,6 @@ final class VideoSyncViewController: UIViewController {
         ])
 
         refreshOffsetLabel()
-    }
-
-    private func promptGrouping(groups: [VideoInfo.Category: [URL]],
-                                 rates: [VideoInfo.Category: [Double]]) {
-        guard let biggest = groups.max(by: { $0.value.count < $1.value.count }) else { return }
-        let category = biggest.key
-        let list = biggest.value
-        let average = (rates[category] ?? []).reduce(0, +) / Double(max(1, list.count))
-        let suggested = OffsetStore.suggestion(forMbps: average) ?? offsetMs
-
-        var summary: [String] = []
-        for (key, value) in groups.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
-            summary.append("\(key.rawValue) \(value.count) 个")
-        }
-
-        let alert = UIAlertController(
-            title: "选了 \(groups.count) 种规格",
-            message: summary.joined(separator: " · ") + "\n\n混着导会有一半不同步。建议先导「\(category.rawValue)」这 \(list.count) 个，偏移用 \(Int(suggested)) ms。",
-            preferredStyle: .alert)
-
-        alert.addAction(UIAlertAction(title: "只导这 \(list.count) 个", style: .default) { [weak self] _ in
-            guard let self else { return }
-            self.sources = list
-            self.sourceSizes = list.map {
-                Int64((try? $0.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-            }
-            self.offsetMs = suggested
-            self.slider.value = Float(suggested)
-            self.refresh()
-            let total = self.sourceSizes.reduce(0, +)
-            self.statusLabel.text = "已选 \(list.count) 个（\(category.rawValue)）· \(Format.bytes(total))\n偏移 \(Int(suggested)) ms，可以点导出了"
-        })
-        alert.addAction(UIAlertAction(title: "全部一起导", style: .cancel))
-        present(alert, animated: true)
     }
 
     private func makeButton(_ title: String, _ action: Selector) -> UIButton {
@@ -1000,6 +966,40 @@ final class CompensateViewController: UIViewController {
         let button = UIButton(configuration: config)
         button.addTarget(self, action: action, for: .touchUpInside)
         return button
+    }
+
+    private func promptGrouping(groups: [VideoInfo.Category: [URL]],
+                                 rates: [VideoInfo.Category: [Double]]) {
+        guard let biggest = groups.max(by: { $0.value.count < $1.value.count }) else { return }
+        let category = biggest.key
+        let list = biggest.value
+        let average = (rates[category] ?? []).reduce(0, +) / Double(max(1, list.count))
+        let suggested = OffsetStore.suggestion(forMbps: average) ?? offsetMs
+
+        var summary: [String] = []
+        for (key, value) in groups.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
+            summary.append("\(key.rawValue) \(value.count) 个")
+        }
+
+        let alert = UIAlertController(
+            title: "选了 \(groups.count) 种规格",
+            message: summary.joined(separator: " · ") + "\n\n混着导会有一半不同步。建议先导「\(category.rawValue)」这 \(list.count) 个，偏移用 \(Int(suggested)) ms。",
+            preferredStyle: .alert)
+
+        alert.addAction(UIAlertAction(title: "只导这 \(list.count) 个", style: .default) { [weak self] _ in
+            guard let self else { return }
+            self.sources = list
+            self.sourceSizes = list.map {
+                Int64((try? $0.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            }
+            self.offsetMs = suggested
+            self.slider.value = Float(suggested)
+            self.refresh()
+            let total = self.sourceSizes.reduce(0, +)
+            self.statusLabel.text = "已选 \(list.count) 个（\(category.rawValue)）· \(Format.bytes(total))\n偏移 \(Int(suggested)) ms，可以点导出了"
+        })
+        alert.addAction(UIAlertAction(title: "全部一起导", style: .cancel))
+        present(alert, animated: true)
     }
 
     private func makePresetButton(_ title: String, _ value: Double) -> UIButton {
