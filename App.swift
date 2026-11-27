@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "5.0"
-    static let note = "seven-pass"
+    static let version = "5.1"
+    static let note = "nav-fix"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -1585,15 +1585,17 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
     private var selecting = false
     private var sortBySize = false
     private var sortButton: UIBarButtonItem?
+    private var selectItem: UIBarButtonItem?
     private let emptyLabel = UILabel()
 
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "已导出"
         view.backgroundColor = .systemGroupedBackground
-        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "选择", style: .plain,
-                                                            target: self,
-                                                            action: #selector(toggleSelecting))
+        let selectItem = UIBarButtonItem(title: "选择", style: .plain,
+                                         target: self,
+                                         action: #selector(toggleSelecting))
+        self.selectItem = selectItem
 
         let timeAction = UIAction(title: "按时间", state: .on) { [weak self] _ in
             self?.sortBySize = false
@@ -1607,7 +1609,8 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         }
         sortButton = UIBarButtonItem(image: UIImage(systemName: "arrow.up.arrow.down"),
                                      menu: UIMenu(title: "排序", children: [timeAction, sizeAction]))
-        navigationItem.leftBarButtonItem = sortButton
+        // 放右侧，左侧留给系统返回键
+        navigationItem.rightBarButtonItems = [selectItem, sortButton]
 
         table.dataSource = self
         table.delegate = self
@@ -1682,7 +1685,7 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
     @objc private func toggleSelecting() {
         selecting.toggle()
         table.setEditing(selecting, animated: true)
-        navigationItem.rightBarButtonItem?.title = selecting ? "完成" : "选择"
+        selectItem?.title = selecting ? "完成" : "选择"
         if !selecting { clearSelection() }
         table.reloadData()
         updateBar()
@@ -1733,7 +1736,7 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
             urls.forEach { try? FileManager.default.removeItem(at: $0) }
             self.selecting = false
             self.table.setEditing(false, animated: true)
-            self.navigationItem.rightBarButtonItem?.title = "选择"
+            self.selectItem?.title = "选择"
             self.reload()
         })
         alert.addAction(UIAlertAction(title: "取消", style: .cancel))
