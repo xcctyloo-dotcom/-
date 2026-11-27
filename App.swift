@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "4.3"
-    static let note = "text-hierarchy"
+    static let version = "4.4"
+    static let note = "hardening"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -762,6 +762,13 @@ enum CompensateExporter {
                        progress: @escaping (Double) -> Void,
                        completion: @escaping (Result<URL, Error>) -> Void) {
         cancelled = false
+        var settled = false
+        let done: (Result<URL, Error>) -> Void = { result in
+            guard !settled else { return }
+            settled = true
+            completion(result)
+        }
+
         let out = outputURL(source: source, offsetMs: offsetMs)
         Remuxer.shift(source: source, offsetMs: offsetMs, to: out, progress: progress) { result in
             switch result {
@@ -769,20 +776,20 @@ enum CompensateExporter {
                 // 校验：能读、时长大于 0，才算成功
                 let check = AVURLAsset(url: out)
                 if CMTimeGetSeconds(check.duration) > 0.2 {
-                    completion(.success(out))
+                    done(.success(out))
                 } else {
                     Log.write("remux invalid output, fallback")
                     exportByComposition(source: source, offsetMs: offsetMs,
-                                        progress: progress, completion: completion)
+                                        progress: progress, completion: done)
                 }
             case .failure(let error):
                 if cancelled {
-                    completion(.failure(CompensateError.exportFailed("已取消")))
+                    done(.failure(CompensateError.exportFailed("已取消")))
                     return
                 }
                 Log.write("remux fallback: \(error.localizedDescription)")
                 exportByComposition(source: source, offsetMs: offsetMs,
-                                    progress: progress, completion: completion)
+                                    progress: progress, completion: done)
             }
         }
     }
@@ -1136,6 +1143,10 @@ final class CompensateViewController: UIViewController {
     // MARK: 选视频
 
     @objc private func pickVideo() {
+        guard !exporting else {
+            statusLabel.text = "导出中，先等这一批跑完"
+            return
+        }
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.movie], asCopy: true)
         picker.delegate = self
         picker.allowsMultipleSelection = true
@@ -1248,18 +1259,12 @@ final class CompensateViewController: UIViewController {
         let startedAt = Date()
         fileStartedAt = Date()
 
-        // 单个文件最长 15 分钟，卡住就放弃它、继续下一个
-        fileTimeout?.cancel()
-        let watchdog = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            Log.write("export timeout \(url.lastPathComponent)")
-            CompensateExporter.cancel()
-        }
-        fileTimeout = watchdog
-        DispatchQueue.main.asyncAfter(deadline: .now() + 900, execute: watchdog)
+        // 5 分钟内没有任何新进展才放弃，避免长片被误杀
+        armFileWatchdog(for: url)
 
         CompensateExporter.export(source: url, offsetMs: offsetMs, progress: { [weak self] p in
             guard let self else { return }
+            self.armFileWatchdog(for: url)
             let overall = (Double(self.completed + self.failed) + p) / Double(max(1, self.sources.count))
             self.updateProgress(overall: overall, current: p)
         }, completion: { [weak self] result in
@@ -1290,6 +1295,17 @@ final class CompensateViewController: UIViewController {
             self.currentIndex += 1
             self.runNext()
         })
+    }
+
+    private func armFileWatchdog(for url: URL) {
+        fileTimeout?.cancel()
+        let watchdog = DispatchWorkItem { [weak self] in
+            guard let self, self.exporting else { return }
+            Log.write("export stalled \(url.lastPathComponent)")
+            CompensateExporter.cancel()
+        }
+        fileTimeout = watchdog
+        DispatchQueue.main.asyncAfter(deadline: .now() + 300, execute: watchdog)
     }
 
     /// 只删临时目录里的拷贝，别碰用户原文件
@@ -3130,6 +3146,7 @@ enum Remuxer {
         let watchdog = DispatchWorkItem {
             guard !settled else { return }
             Log.write("remux timeout \(source.lastPathComponent)")
+            reader.cancelReading()
             writer.cancelWriting()
             settle(.failure(CompensateError.exportFailed("remux timeout")))
         }
