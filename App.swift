@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "4.0"
-    static let note = "ui"
+    static let version = "4.1"
+    static let note = "ui-polish"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -202,8 +202,10 @@ final class MenuViewController: UIViewController {
         var config = UIButton.Configuration.filled()
         config.title = title
         config.subtitle = subtitle
-        config.image = UIImage(systemName: symbol)
-        config.preferredSymbolConfigurationForImage = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+        let symbolConfig = UIImage.SymbolConfiguration(pointSize: 18, weight: .semibold)
+        config.image = UIImage(systemName: symbol)?
+            .withConfiguration(symbolConfig)
+            .withTintColor(Theme.accent, renderingMode: .alwaysOriginal)
         config.imagePadding = 12
         config.imagePlacement = .leading
         config.cornerStyle = .large
@@ -885,6 +887,7 @@ final class CompensateViewController: UIViewController {
 
     private let stack = UIStackView()
     private let valueLabel = UILabel()
+    private let directionLabel = UILabel()
     private let statusLabel = UILabel()
     private let learnLabel = UILabel()
     private let slider = UISlider()
@@ -953,6 +956,10 @@ final class CompensateViewController: UIViewController {
         valueLabel.textColor = Theme.accent
         valueLabel.textAlignment = .center
 
+        directionLabel.font = .systemFont(ofSize: 13, weight: .regular)
+        directionLabel.textColor = .secondaryLabel
+        directionLabel.textAlignment = .center
+
         slider.minimumValue = -400
         slider.maximumValue = 400
         slider.value = Float(offsetMs)
@@ -981,7 +988,7 @@ final class CompensateViewController: UIViewController {
         presetRow.distribution = .fillEqually
         presetRow.spacing = 6
 
-        let exportButton = makeButton("导出补偿版", #selector(runExport))
+        let exportButton = makeButton("导出补偿版", #selector(runExport), primary: true)
         actionButton = exportButton
         shareButton.isHidden = true
 
@@ -991,7 +998,7 @@ final class CompensateViewController: UIViewController {
         stack.isLayoutMarginsRelativeArrangement = true
         stack.layoutMargins = UIEdgeInsets(top: 0, left: 20, bottom: 20, right: 20)
 
-        [help, valueLabel, slider, presetRow,
+        [help, valueLabel, directionLabel, slider, presetRow,
          makeButton("自动测量延迟", #selector(measureTapped)),
          makeButton("从相册选择（可多选）", #selector(pickFromPhotos)),
          makeButton("从文件选择（可多选）", #selector(pickVideo)),
@@ -1007,11 +1014,13 @@ final class CompensateViewController: UIViewController {
         refresh()
     }
 
-    private func makeButton(_ title: String, _ action: Selector) -> UIButton {
-        var config = UIButton.Configuration.filled()
+    /// primary = true 用实心，其余用浅底，形成主次
+    private func makeButton(_ title: String, _ action: Selector, primary: Bool = false) -> UIButton {
+        var config = primary ? UIButton.Configuration.filled() : UIButton.Configuration.tinted()
         config.title = title
         config.cornerStyle = .large
         config.baseBackgroundColor = Theme.accent
+        config.baseForegroundColor = primary ? .white : Theme.accent
         config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16)
         let button = UIButton(configuration: config)
         button.addTarget(self, action: action, for: .touchUpInside)
@@ -1088,12 +1097,13 @@ final class CompensateViewController: UIViewController {
         let direction = offsetMs > 0 ? "音频后移" : (offsetMs < 0 ? "画面后移" : "不偏移")
         valueLabel.text = String(format: "%+.0f ms", offsetMs)
         valueLabel.accessibilityLabel = String(format: "%.0f 毫秒，%@", offsetMs, direction)
+        directionLabel.text = direction
 
         for (button, value) in presetButtons {
             var config = button.configuration
             let selected = abs(value - offsetMs) < 0.5
-            config?.baseBackgroundColor = selected ? Theme.accent : Theme.card
-            config?.baseForegroundColor = selected ? .white : Theme.accent
+            config?.baseBackgroundColor = selected ? Theme.accent : UIColor.tertiarySystemFill
+            config?.baseForegroundColor = selected ? .white : .secondaryLabel
             button.configuration = config
         }
 
