@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "3.8"
-    static let note = "self-check"
+    static let version = "3.9"
+    static let note = "skip-detail"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -875,6 +875,8 @@ final class CompensateViewController: UIViewController {
     private var importFailures = 0
     private var importTimeout: DispatchWorkItem?
     private var importAborted = false
+    private var importFailureNames: [String] = []
+    private var overwriteCount = 0
 
     private lazy var shareButton: UIButton = {
         var config = UIButton.Configuration.tinted()
@@ -1118,14 +1120,27 @@ final class CompensateViewController: UIViewController {
             FileManager.default.fileExists(atPath: CompensateExporter.outputURL(source: $0, offsetMs: offsetMs).path)
         }
         guard !existing.isEmpty else {
+            overwriteCount = 0
             completion()
             return
         }
+
+        let names = existing.prefix(6).map {
+            CompensateExporter.outputURL(source: $0, offsetMs: offsetMs).lastPathComponent
+        }
+        var message = names.joined(separator: "\n")
+        if existing.count > names.count {
+            message += "\n……等 \(existing.count) 个"
+        }
+
         let alert = UIAlertController(title: "会覆盖 \(existing.count) 个已有文件",
-                                      message: "同名导出文件已经存在，继续会替换掉它。",
+                                      message: message,
                                       preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "取消", style: .cancel))
-        alert.addAction(UIAlertAction(title: "覆盖", style: .default) { _ in completion() })
+        alert.addAction(UIAlertAction(title: "覆盖", style: .default) { [weak self] _ in
+            self?.overwriteCount = existing.count
+            completion()
+        })
         present(alert, animated: true)
     }
 
@@ -1137,6 +1152,7 @@ final class CompensateViewController: UIViewController {
         currentIndex = 0
         lastExport = nil
         outputs = []
+        overwriteCount = 0
         startedAt = Date()
         shareButton.isHidden = true
         progressBar.isHidden = false
@@ -1239,9 +1255,11 @@ final class CompensateViewController: UIViewController {
             shareButton.configuration = config
             let size = Int64((try? lastExport.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
             if sources.count > 1 {
-                statusLabel.text = "完成 \(completed) 个，失败 \(failed) 个\(wasCancelled ? "（已取消）" : "")\n最后一份 \(Format.bytes(size)) · 文件 App → CarPlayCast"
+                let extra = overwriteCount > 0 ? "，覆盖 \(overwriteCount) 个旧文件" : ""
+                statusLabel.text = "完成 \(completed) 个，失败 \(failed) 个\(extra)\(wasCancelled ? "（已取消）" : "")\n最后一份 \(Format.bytes(size)) · 文件 App → CarPlayCast"
             } else {
-                statusLabel.text = "完成 · \(Format.bytes(size))\n\(lastExport.lastPathComponent)\n位置：文件 App → CarPlayCast"
+                let extra = overwriteCount > 0 ? "（覆盖了旧文件）" : ""
+                statusLabel.text = "完成\(extra) · \(Format.bytes(size))\n\(lastExport.lastPathComponent)\n位置：文件 App → CarPlayCast"
             }
         } else if sources.count > 1 {
             statusLabel.text = "完成 \(completed) 个，失败 \(failed) 个\(wasCancelled ? "（已取消）" : "")"
@@ -1300,6 +1318,8 @@ extension CompensateViewController: UIDocumentPickerDelegate {
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         guard !urls.isEmpty else { return }
         importFailures = 0
+        importAborted = false
+        importFailureNames = []
         applySelection(urls)
     }
 }
@@ -2113,6 +2133,7 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
         statusLabel.text = "正在从相册导入 \(providers.count) 个…"
         importFailures = 0
         importAborted = false
+        importFailureNames = []
         importProviders(providers, index: 0, collected: [])
     }
 
@@ -2128,6 +2149,9 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
         if CompensateExporter.freeSpace() < 800_000_000 {
             let skipped = providers.count - index
             importFailures += skipped
+            for i in index..<providers.count {
+                importFailureNames.append(providers[i].suggestedName ?? "第 \(i + 1) 个")
+            }
             Log.write("import stopped: low disk, skipped \(skipped)")
             applySelection(collected)
             return
@@ -2141,6 +2165,9 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
             Log.write("import timeout at index \(index)")
             self.importAborted = true
             self.importFailures += providers.count - index
+            for i in index..<providers.count {
+                self.importFailureNames.append(providers[i].suggestedName ?? "第 \(i + 1) 个")
+            }
             self.applySelection(collected)
         }
         importTimeout = timeout
@@ -2163,7 +2190,9 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
                 if (try? FileManager.default.copyItem(at: url, to: dst)) != nil {
                     copied = dst
                 } else {
-                    Log.write("import failed: \(url.lastPathComponent)")
+                    let name = provider.suggestedName ?? "第 \(index + 1) 个"
+                    Log.write("import failed: \(name)")
+                    DispatchQueue.main.async { self?.importFailureNames.append(name) }
                 }
             }
             DispatchQueue.main.async {
@@ -2226,13 +2255,19 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
                 text += "\n" + lines.joined(separator: "\n")
             }
             if importFailures > 0 {
-                text += "\n有 \(importFailures) 个导入失败，已跳过"
+                let shown = importFailureNames.prefix(3).joined(separator: "、")
+                let suffix = importFailureNames.count > 3 ? " 等 \(importFailureNames.count) 个" : ""
+                text += "\n已跳过：" + (shown.isEmpty ? "\(importFailures) 个（名字未知）" : shown + suffix)
             }
             statusLabel.text = text
 
             if groups.count > 1 {
                 promptGrouping(groups: groups, rates: rates)
             }
+        } else if !importFailureNames.isEmpty {
+            statusLabel.text = "全部导入失败，共 \(importFailureNames.count) 个：\n"
+                + importFailureNames.prefix(5).joined(separator: "\n")
+                + (importFailureNames.count > 5 ? "\n……" : "")
         } else {
             statusLabel.text = "没选到视频"
         }
