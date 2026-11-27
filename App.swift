@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "4.2"
-    static let note = "ui-unify"
+    static let version = "4.3"
+    static let note = "text-hierarchy"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -490,12 +490,16 @@ final class VideoSyncViewController: UIViewController {
     }
 
     private func makeButton(_ title: String, _ action: Selector) -> UIButton {
-        let b = UIButton(type: .system)
-        b.setTitle(title, for: .normal)
-        b.titleLabel?.font = .systemFont(ofSize: 14, weight: .medium)
-        b.tintColor = Theme.accent
+        var config = UIButton.Configuration.tinted()
+        config.title = title
+        config.cornerStyle = .capsule
+        config.baseBackgroundColor = Theme.accent
+        config.baseForegroundColor = Theme.accent
+        config.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10)
+
+        let b = UIButton(configuration: config)
         b.addTarget(self, action: action, for: .touchUpInside)
-        b.heightAnchor.constraint(equalToConstant: 38).isActive = true
+        b.heightAnchor.constraint(equalToConstant: 40).isActive = true
         return b
     }
 
@@ -1675,6 +1679,29 @@ final class AboutViewController: UIViewController {
         每次导出记录「码率 → 偏移」，累积 3 部以上且码率跨度够，就会拟合出规律，
         选新片时自动给出参考值。码率分四档：低 <4、中 4-10、高 10-20、超高 >20 Mbps。
         """
+        // 短行当标题，其余当正文，避免整页同字号
+        if let raw = text.text {
+            let result = NSMutableAttributedString()
+            let bodyColor = UIColor.label
+            let headColor = Theme.accent
+            for line in raw.components(separatedBy: "\n") {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                let isHeading = !trimmed.isEmpty
+                    && trimmed.count <= 8
+                    && !trimmed.hasPrefix("·")
+                    && trimmed.first?.isNumber != true
+
+                let attributes: [NSAttributedString.Key: Any] = isHeading
+                    ? [.font: UIFont.systemFont(ofSize: 17, weight: .semibold),
+                       .foregroundColor: headColor]
+                    : [.font: UIFont.systemFont(ofSize: 15),
+                       .foregroundColor: bodyColor]
+
+                result.append(NSAttributedString(string: line + "\n", attributes: attributes))
+            }
+            text.textStorage.setAttributedString(result)
+        }
+
         view.addSubview(text)
 
         NSLayoutConstraint.activate([
