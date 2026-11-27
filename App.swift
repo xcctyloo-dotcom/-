@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "5.1"
-    static let note = "nav-fix"
+    static let version = "5.2"
+    static let note = "nav-fix2"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -1607,10 +1607,11 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
             self?.updateSortMenu()
             self?.reload()
         }
-        sortButton = UIBarButtonItem(image: UIImage(systemName: "arrow.up.arrow.down"),
+        let sort = UIBarButtonItem(image: UIImage(systemName: "arrow.up.arrow.down"),
                                      menu: UIMenu(title: "排序", children: [timeAction, sizeAction]))
+        sortButton = sort
         // 放右侧，左侧留给系统返回键
-        navigationItem.rightBarButtonItems = [selectItem, sortButton]
+        navigationItem.rightBarButtonItems = [selectItem, sort]
 
         table.dataSource = self
         table.delegate = self
