@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "4.1"
-    static let note = "ui-polish"
+    static let version = "4.2"
+    static let note = "ui-unify"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -428,7 +428,7 @@ final class VideoSyncViewController: UIViewController {
 
     private func buildPanel() {
         offsetLabel.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
-        offsetLabel.textColor = .systemYellow
+        offsetLabel.textColor = Theme.accent
 
         timeLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         timeLabel.textColor = .white
@@ -493,6 +493,7 @@ final class VideoSyncViewController: UIViewController {
         let b = UIButton(type: .system)
         b.setTitle(title, for: .normal)
         b.titleLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+        b.tintColor = Theme.accent
         b.addTarget(self, action: action, for: .touchUpInside)
         b.heightAnchor.constraint(equalToConstant: 38).isActive = true
         return b
@@ -1103,7 +1104,7 @@ final class CompensateViewController: UIViewController {
             var config = button.configuration
             let selected = abs(value - offsetMs) < 0.5
             config?.baseBackgroundColor = selected ? Theme.accent : UIColor.tertiarySystemFill
-            config?.baseForegroundColor = selected ? .white : .secondaryLabel
+            config?.baseForegroundColor = selected ? .white : .label
             button.configuration = config
         }
 
@@ -1570,12 +1571,15 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         let url = files[indexPath.row]
         var content = cell.defaultContentConfiguration()
         content.text = url.lastPathComponent
+        content.textProperties.numberOfLines = 1
+        content.textProperties.lineBreakMode = .byTruncatingMiddle
         content.image = UIImage(systemName: "film")
         content.imageProperties.tintColor = Theme.accent
         content.imageProperties.maximumSize = CGSize(width: 22, height: 22)
         let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
         if let info = VideoInfoCache.cached(url) {
-            content.secondaryText = info.summary + " · " + Format.bytes(size)
+            content.secondaryText = info.shortSummary + " · " + Format.bytes(size)
+            content.secondaryTextProperties.numberOfLines = 1
         } else {
             content.secondaryText = Format.bytes(size)
             let row = indexPath.row
@@ -2719,7 +2723,9 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
 
         var config = UIButton.Configuration.filled()
         config.title = "启动本地服务"
-        config.cornerStyle = .medium
+        config.cornerStyle = .large
+        config.baseBackgroundColor = Theme.accent
+        config.contentInsets = NSDirectionalEdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16)
         toggleButton.configuration = config
         toggleButton.addAction(UIAction { [weak self] _ in self?.toggle() }, for: .touchUpInside)
 
@@ -2729,7 +2735,10 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
 
         var playlistConfig = UIButton.Configuration.tinted()
         playlistConfig.title = "复制播放列表链接（一次添加全部）"
-        playlistConfig.cornerStyle = .medium
+        playlistConfig.cornerStyle = .large
+        playlistConfig.baseBackgroundColor = Theme.accent
+        playlistConfig.baseForegroundColor = Theme.accent
+        playlistConfig.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 16, bottom: 12, trailing: 16)
         playlistButton.configuration = playlistConfig
         playlistButton.addAction(UIAction { [weak self] _ in self?.copyPlaylist() }, for: .touchUpInside)
 
@@ -2871,6 +2880,12 @@ enum VideoInfo {
 
         var category: Category {
             Category.of(megabitsPerSecond)
+        }
+
+        var shortSummary: String {
+            let size = width > 0 ? "\(width)×\(height)" : "分辨率未知"
+            let rate = megabitsPerSecond > 0 ? String(format: "%.1f Mbps", megabitsPerSecond) : "码率未知"
+            return "\(size) · \(rate) · \(codec)"
         }
 
         var summary: String {
