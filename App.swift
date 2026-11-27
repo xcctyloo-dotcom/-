@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "3.6"
-    static let note = "import-timeout"
+    static let version = "3.8"
+    static let note = "self-check"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -691,7 +691,11 @@ enum CompensateExporter {
         AVAssetExportPresetHighestQuality
     ]
 
+    static var cancelled = false
+
     static func cancel() {
+        cancelled = true
+        Remuxer.cancel()
         current?.cancelExport()
         timer?.invalidate()
         timer = nil
@@ -717,6 +721,7 @@ enum CompensateExporter {
                        offsetMs: Double,
                        progress: @escaping (Double) -> Void,
                        completion: @escaping (Result<URL, Error>) -> Void) {
+        cancelled = false
         let out = outputURL(source: source, offsetMs: offsetMs)
         Remuxer.shift(source: source, offsetMs: offsetMs, to: out, progress: progress) { result in
             switch result {
@@ -731,6 +736,10 @@ enum CompensateExporter {
                                         progress: progress, completion: completion)
                 }
             case .failure(let error):
+                if cancelled {
+                    completion(.failure(CompensateError.exportFailed("已取消")))
+                    return
+                }
                 Log.write("remux fallback: \(error.localizedDescription)")
                 exportByComposition(source: source, offsetMs: offsetMs,
                                     progress: progress, completion: completion)
@@ -865,6 +874,7 @@ final class CompensateViewController: UIViewController {
     private var fileStartedAt: Date?
     private var importFailures = 0
     private var importTimeout: DispatchWorkItem?
+    private var importAborted = false
 
     private lazy var shareButton: UIButton = {
         var config = UIButton.Configuration.tinted()
@@ -2102,10 +2112,13 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
     private func startPhotoImport(_ providers: [NSItemProvider]) {
         statusLabel.text = "正在从相册导入 \(providers.count) 个…"
         importFailures = 0
+        importAborted = false
         importProviders(providers, index: 0, collected: [])
     }
 
     private func importProviders(_ providers: [NSItemProvider], index: Int, collected: [URL]) {
+        guard !importAborted else { return }
+
         guard index < providers.count else {
             applySelection(collected)
             return
@@ -2126,6 +2139,7 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
         let timeout = DispatchWorkItem { [weak self] in
             guard let self else { return }
             Log.write("import timeout at index \(index)")
+            self.importAborted = true
             self.importFailures += providers.count - index
             self.applySelection(collected)
         }
@@ -2153,7 +2167,7 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
                 }
             }
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, !self.importAborted else { return }
                 self.importTimeout?.cancel()
                 var next = collected
                 if let copied { next.append(copied) }
@@ -2872,15 +2886,30 @@ enum VideoInfoCache {
 /// 4K 一部长片从"几十分钟"降到"几十秒"。
 enum Remuxer {
 
+    static var activeWriter: AVAssetWriter?
+
+    static func cancel() {
+        activeWriter?.cancelWriting()
+        activeWriter = nil
+    }
+
     static func shift(source: URL,
                       offsetMs: Double,
                       to out: URL,
                       progress: @escaping (Double) -> Void,
                       completion: @escaping (Result<URL, Error>) -> Void) {
 
+        var settled = false
+        let settle: (Result<URL, Error>) -> Void = { result in
+            guard !settled else { return }
+            settled = true
+            activeWriter = nil
+            completion(result)
+        }
+
         let asset = AVURLAsset(url: source)
         guard let videoTrack = asset.tracks(withMediaType: .video).first else {
-            completion(.failure(CompensateError.noVideoTrack))
+            settle(.failure(CompensateError.noVideoTrack))
             return
         }
         let audioTrack = asset.tracks(withMediaType: .audio).first
@@ -2888,14 +2917,14 @@ enum Remuxer {
         try? FileManager.default.removeItem(at: out)
 
         guard let reader = try? AVAssetReader(asset: asset) else {
-            completion(.failure(CompensateError.exportFailed("reader 创建失败")))
+            settle(.failure(CompensateError.exportFailed("reader 创建失败")))
             return
         }
 
         let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
         videoOutput.alwaysCopiesSampleData = false
         guard reader.canAdd(videoOutput) else {
-            completion(.failure(CompensateError.exportFailed("无法读取视频轨")))
+            settle(.failure(CompensateError.exportFailed("无法读取视频轨")))
             return
         }
         reader.add(videoOutput)
@@ -2911,14 +2940,14 @@ enum Remuxer {
         }
 
         guard let writer = try? AVAssetWriter(outputURL: out, fileType: .mp4) else {
-            completion(.failure(CompensateError.exportFailed("writer 创建失败")))
+            settle(.failure(CompensateError.exportFailed("writer 创建失败")))
             return
         }
 
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
         videoInput.expectsMediaDataInRealTime = false
         guard writer.canAdd(videoInput) else {
-            completion(.failure(CompensateError.exportFailed("无法写入视频轨")))
+            settle(.failure(CompensateError.exportFailed("无法写入视频轨")))
             return
         }
         writer.add(videoInput)
@@ -2927,21 +2956,34 @@ enum Remuxer {
         if audioOutput != nil {
             let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
             input.expectsMediaDataInRealTime = false
-            if writer.canAdd(input) {
-                writer.add(input)
-                audioInput = input
+            guard writer.canAdd(input) else {
+                settle(.failure(CompensateError.exportFailed("音轨无法写入")))
+                return
             }
+            writer.add(input)
+            audioInput = input
         }
 
+        activeWriter = writer
+        Log.write("remux start \(source.lastPathComponent)")
+        // 免转码 2 分钟不完成就认输，交给转码兜底
+        let watchdog = DispatchWorkItem {
+            guard !settled else { return }
+            Log.write("remux timeout \(source.lastPathComponent)")
+            writer.cancelWriting()
+            settle(.failure(CompensateError.exportFailed("remux timeout")))
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120, execute: watchdog)
+
         guard writer.startWriting() else {
-            completion(.failure(CompensateError.exportFailed(
+            settle(.failure(CompensateError.exportFailed(
                 writer.error?.localizedDescription ?? "writer 启动失败")))
             return
         }
         writer.startSession(atSourceTime: .zero)
         guard reader.startReading() else {
             writer.cancelWriting()
-            completion(.failure(CompensateError.exportFailed("reader 启动失败")))
+            settle(.failure(CompensateError.exportFailed("reader 启动失败")))
             return
         }
 
@@ -2966,7 +3008,7 @@ enum Remuxer {
         group.notify(queue: .main) {
             if reader.status == .failed {
                 writer.cancelWriting()
-                completion(.failure(CompensateError.exportFailed(
+                settle(.failure(CompensateError.exportFailed(
                     reader.error?.localizedDescription ?? "读取中断")))
                 return
             }
@@ -2977,10 +3019,11 @@ enum Remuxer {
             writer.finishWriting {
                 DispatchQueue.main.async {
                     if writer.status == .completed {
+                        Log.write("remux done \(out.lastPathComponent)")
                         progress(1)
-                        completion(.success(out))
+                        settle(.success(out))
                     } else {
-                        completion(.failure(CompensateError.exportFailed(
+                        settle(.failure(CompensateError.exportFailed(
                             writer.error?.localizedDescription ?? "写入失败")))
                     }
                 }
@@ -3002,7 +3045,6 @@ enum Remuxer {
                 guard let sample = output.copyNextSampleBuffer() else {
                     if !finished {
                         finished = true
-                        input.markAsFinished()
                         done()
                     }
                     return
