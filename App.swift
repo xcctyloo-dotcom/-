@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "3.0"
-    static let note = "triple-audit"
+    static let version = "3.4"
+    static let note = "remux-verified"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -454,6 +454,40 @@ final class VideoSyncViewController: UIViewController {
         refreshOffsetLabel()
     }
 
+    private func promptGrouping(groups: [VideoInfo.Category: [URL]],
+                                 rates: [VideoInfo.Category: [Double]]) {
+        guard let biggest = groups.max(by: { $0.value.count < $1.value.count }) else { return }
+        let category = biggest.key
+        let list = biggest.value
+        let average = (rates[category] ?? []).reduce(0, +) / Double(max(1, list.count))
+        let suggested = OffsetStore.suggestion(forMbps: average) ?? offsetMs
+
+        var summary: [String] = []
+        for (key, value) in groups.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
+            summary.append("\(key.rawValue) \(value.count) 个")
+        }
+
+        let alert = UIAlertController(
+            title: "选了 \(groups.count) 种规格",
+            message: summary.joined(separator: " · ") + "\n\n混着导会有一半不同步。建议先导「\(category.rawValue)」这 \(list.count) 个，偏移用 \(Int(suggested)) ms。",
+            preferredStyle: .alert)
+
+        alert.addAction(UIAlertAction(title: "只导这 \(list.count) 个", style: .default) { [weak self] _ in
+            guard let self else { return }
+            self.sources = list
+            self.sourceSizes = list.map {
+                Int64((try? $0.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            }
+            self.offsetMs = suggested
+            self.slider.value = Float(suggested)
+            self.refresh()
+            let total = self.sourceSizes.reduce(0, +)
+            self.statusLabel.text = "已选 \(list.count) 个（\(category.rawValue)）· \(Format.bytes(total))\n偏移 \(Int(suggested)) ms，可以点导出了"
+        })
+        alert.addAction(UIAlertAction(title: "全部一起导", style: .cancel))
+        present(alert, animated: true)
+    }
+
     private func makeButton(_ title: String, _ action: Selector) -> UIButton {
         let b = UIButton(type: .system)
         b.setTitle(title, for: .normal)
@@ -712,11 +746,37 @@ enum CompensateExporter {
         return documentsDir().appendingPathComponent("\(base)_\(sign)\(Int(abs(offsetMs)))ms.mp4")
     }
 
-    /// offsetMs > 0：音频后移；offsetMs < 0：画面后移
+    /// 先试免转码重封装，失败再退回转码
     static func export(source: URL,
                        offsetMs: Double,
                        progress: @escaping (Double) -> Void,
                        completion: @escaping (Result<URL, Error>) -> Void) {
+        let out = outputURL(source: source, offsetMs: offsetMs)
+        Remuxer.shift(source: source, offsetMs: offsetMs, to: out, progress: progress) { result in
+            switch result {
+            case .success:
+                // 校验：能读、时长大于 0，才算成功
+                let check = AVURLAsset(url: out)
+                if CMTimeGetSeconds(check.duration) > 0.2 {
+                    completion(.success(out))
+                } else {
+                    Log.write("remux invalid output, fallback")
+                    exportByComposition(source: source, offsetMs: offsetMs,
+                                        progress: progress, completion: completion)
+                }
+            case .failure(let error):
+                Log.write("remux fallback: \(error.localizedDescription)")
+                exportByComposition(source: source, offsetMs: offsetMs,
+                                    progress: progress, completion: completion)
+            }
+        }
+    }
+
+    /// offsetMs > 0：音频后移；offsetMs < 0：画面后移
+    private static func exportByComposition(source: URL,
+                                            offsetMs: Double,
+                                            progress: @escaping (Double) -> Void,
+                                            completion: @escaping (Result<URL, Error>) -> Void) {
         let asset = AVURLAsset(url: source)
 
         guard let videoTrack = asset.tracks(withMediaType: .video).first else {
@@ -836,6 +896,8 @@ final class CompensateViewController: UIViewController {
     private var lastExport: URL?
     private var outputs: [URL] = []
     private var fileTimeout: DispatchWorkItem?
+    private var fileStartedAt: Date?
+    private var importFailures = 0
 
     private lazy var shareButton: UIButton = {
         var config = UIButton.Configuration.tinted()
@@ -1087,6 +1149,7 @@ final class CompensateViewController: UIViewController {
 
         let url = sources[currentIndex]
         let startedAt = Date()
+        fileStartedAt = Date()
 
         // 单个文件最长 15 分钟，卡住就放弃它、继续下一个
         fileTimeout?.cancel()
@@ -1124,9 +1187,19 @@ final class CompensateViewController: UIViewController {
                 Log.write("export failed \(url.lastPathComponent): \(error.localizedDescription)")
             }
 
+            // 导完就删临时拷贝，避免 12 部 4K 同时占满空间
+            self.cleanupSource(url)
+
             self.currentIndex += 1
             self.runNext()
         })
+    }
+
+    /// 只删临时目录里的拷贝，别碰用户原文件
+    private func cleanupSource(_ url: URL) {
+        let tmp = FileManager.default.temporaryDirectory.path
+        guard url.path.hasPrefix(tmp) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     private func finishQueue() {
@@ -1180,8 +1253,11 @@ final class CompensateViewController: UIViewController {
             let elapsed = Date().timeIntervalSince(startedAt)
             let total = elapsed / overall
             text += " · 预计还需 " + Format.duration(max(0, total - elapsed))
+        } else if let fileStartedAt {
+            // 准备阶段进度是 0，显示“已经跑了多久”，至少知道它活着
+            text += " · 已用 " + Format.duration(Date().timeIntervalSince(fileStartedAt))
         } else {
-            text += " · 估算中…"
+            text += " · 准备中"
         }
         statusLabel.text = text
     }
@@ -1212,6 +1288,7 @@ final class CompensateViewController: UIViewController {
 extension CompensateViewController: UIDocumentPickerDelegate {
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         guard !urls.isEmpty else { return }
+        importFailures = 0
         applySelection(urls)
     }
 }
@@ -2004,12 +2081,40 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
             .filter { $0.hasItemConformingToTypeIdentifier(UTType.movie.identifier) }
         guard !providers.isEmpty else { return }
 
+        let free = CompensateExporter.freeSpace()
+        if free > 0 && free < 2_000_000_000 {
+            let alert = UIAlertController(title: "空间可能不够",
+                                          message: "可用空间只有 \(Format.bytes(free))。从相册导入会先复制一份，大文件可能失败。建议先导出几部、清掉缓存再继续。",
+                                          preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "继续", style: .default) { [weak self] _ in
+                self?.startPhotoImport(providers)
+            })
+            alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+            present(alert, animated: true)
+            return
+        }
+
+        startPhotoImport(providers)
+        importProviders(providers, index: 0, collected: [])
+    }
+
+    private func startPhotoImport(_ providers: [NSItemProvider]) {
         statusLabel.text = "正在从相册导入 \(providers.count) 个…"
+        importFailures = 0
         importProviders(providers, index: 0, collected: [])
     }
 
     private func importProviders(_ providers: [NSItemProvider], index: Int, collected: [URL]) {
         guard index < providers.count else {
+            applySelection(collected)
+            return
+        }
+
+        // 剩不到 800MB 就不再往下拷，避免后面的全变成失败
+        if CompensateExporter.freeSpace() < 800_000_000 {
+            let skipped = providers.count - index
+            importFailures += skipped
+            Log.write("import stopped: low disk, skipped \(skipped)")
             applySelection(collected)
             return
         }
@@ -2029,6 +2134,8 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
                 try? FileManager.default.removeItem(at: dst)
                 if (try? FileManager.default.copyItem(at: url, to: dst)) != nil {
                     copied = dst
+                } else {
+                    Log.write("import failed: \(url.lastPathComponent)")
                 }
             }
             DispatchQueue.main.async {
@@ -2068,21 +2175,35 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
             }
             statusLabel.text = lines.joined(separator: "\n")
         } else if urls.count > 1 {
-            var counts: [String: Int] = [:]
+            var groups: [VideoInfo.Category: [URL]] = [:]
+            var rates: [VideoInfo.Category: [Double]] = [:]
             for url in urls {
                 if let info = VideoInfoCache.info(for: url) {
-                    counts[info.category.rawValue, default: 0] += 1
+                    groups[info.category, default: []].append(url)
+                    rates[info.category, default: []].append(info.megabitsPerSecond)
                 }
             }
+
             var text = "已选 \(urls.count) 个 · 共 \(Format.bytes(total))"
-            if !counts.isEmpty {
-                let detail = counts.map { "\($0.key) \($0.value)" }.sorted().joined(separator: " · ")
-                text += "\n" + detail
-                if counts.count > 1 {
-                    text += "\n码率不一致，建议分组导出，偏移值会差不少"
-                }
+            let order: [VideoInfo.Category] = [.low, .medium, .high, .ultra]
+            var lines: [String] = []
+            for category in order where groups[category] != nil {
+                let list = groups[category] ?? []
+                let average = (rates[category] ?? []).reduce(0, +) / Double(max(1, list.count))
+                let suggested = OffsetStore.suggestion(forMbps: average) ?? offsetMs
+                lines.append("\(category.rawValue) \(list.count) 个 · 建议 \(Int(suggested)) ms")
+            }
+            if !lines.isEmpty {
+                text += "\n" + lines.joined(separator: "\n")
+            }
+            if importFailures > 0 {
+                text += "\n有 \(importFailures) 个导入失败，已跳过"
             }
             statusLabel.text = text
+
+            if groups.count > 1 {
+                promptGrouping(groups: groups, rates: rates)
+            }
         } else {
             statusLabel.text = "没选到视频"
         }
@@ -2727,5 +2848,193 @@ enum VideoInfoCache {
             if let info { store(info, for: url) }
             DispatchQueue.main.async { completion(info) }
         }
+    }
+}
+
+// MARK: - 免转码重封装
+
+/// 只搬动压缩后的样本、改时间戳，画面和声音都不重新编码。
+/// 4K 一部长片从"几十分钟"降到"几十秒"。
+enum Remuxer {
+
+    static func shift(source: URL,
+                      offsetMs: Double,
+                      to out: URL,
+                      progress: @escaping (Double) -> Void,
+                      completion: @escaping (Result<URL, Error>) -> Void) {
+
+        let asset = AVURLAsset(url: source)
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            completion(.failure(CompensateError.noVideoTrack))
+            return
+        }
+        let audioTrack = asset.tracks(withMediaType: .audio).first
+        let duration = CMTimeGetSeconds(asset.duration)
+        try? FileManager.default.removeItem(at: out)
+
+        guard let reader = try? AVAssetReader(asset: asset) else {
+            completion(.failure(CompensateError.exportFailed("reader 创建失败")))
+            return
+        }
+
+        let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+        videoOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(videoOutput) else {
+            completion(.failure(CompensateError.exportFailed("无法读取视频轨")))
+            return
+        }
+        reader.add(videoOutput)
+
+        var audioOutput: AVAssetReaderTrackOutput?
+        if let audioTrack {
+            let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+            output.alwaysCopiesSampleData = false
+            if reader.canAdd(output) {
+                reader.add(output)
+                audioOutput = output
+            }
+        }
+
+        guard let writer = try? AVAssetWriter(outputURL: out, fileType: .mp4) else {
+            completion(.failure(CompensateError.exportFailed("writer 创建失败")))
+            return
+        }
+
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
+        videoInput.expectsMediaDataInRealTime = false
+        guard writer.canAdd(videoInput) else {
+            completion(.failure(CompensateError.exportFailed("无法写入视频轨")))
+            return
+        }
+        writer.add(videoInput)
+
+        var audioInput: AVAssetWriterInput?
+        if audioOutput != nil {
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+            input.expectsMediaDataInRealTime = false
+            if writer.canAdd(input) {
+                writer.add(input)
+                audioInput = input
+            }
+        }
+
+        guard writer.startWriting() else {
+            completion(.failure(CompensateError.exportFailed(
+                writer.error?.localizedDescription ?? "writer 启动失败")))
+            return
+        }
+        writer.startSession(atSourceTime: .zero)
+        guard reader.startReading() else {
+            writer.cancelWriting()
+            completion(.failure(CompensateError.exportFailed("reader 启动失败")))
+            return
+        }
+
+        let magnitude = CMTime(seconds: abs(offsetMs) / 1000.0, preferredTimescale: 600)
+        let videoShift: CMTime = offsetMs < 0 ? magnitude : .zero
+        let audioShift: CMTime = offsetMs > 0 ? magnitude : .zero
+
+        let group = DispatchGroup()
+
+        group.enter()
+        pump(output: videoOutput, input: videoInput, shift: videoShift,
+             duration: duration, progress: nil) { group.leave() }
+
+        if let audioOutput, let audioInput {
+            group.enter()
+            pump(output: audioOutput, input: audioInput, shift: audioShift,
+                 duration: duration, progress: progress) { group.leave() }
+        } else {
+            progress(0.5)
+        }
+
+        group.notify(queue: .main) {
+            if reader.status == .failed {
+                writer.cancelWriting()
+                completion(.failure(CompensateError.exportFailed(
+                    reader.error?.localizedDescription ?? "读取中断")))
+                return
+            }
+
+            videoInput.markAsFinished()
+            audioInput?.markAsFinished()
+
+            writer.finishWriting {
+                DispatchQueue.main.async {
+                    if writer.status == .completed {
+                        progress(1)
+                        completion(.success(out))
+                    } else {
+                        completion(.failure(CompensateError.exportFailed(
+                            writer.error?.localizedDescription ?? "写入失败")))
+                    }
+                }
+            }
+        }
+    }
+
+    private static func pump(output: AVAssetReaderTrackOutput,
+                             input: AVAssetWriterInput,
+                             shift: CMTime,
+                             duration: Double,
+                             progress: ((Double) -> Void)?,
+                             done: @escaping () -> Void) {
+        let queue = DispatchQueue(label: "remux.track")
+        var finished = false
+
+        input.requestMediaDataWhenReady(on: queue) {
+            while input.isReadyForMoreMediaData {
+                guard let sample = output.copyNextSampleBuffer() else {
+                    if !finished {
+                        finished = true
+                        input.markAsFinished()
+                        done()
+                    }
+                    return
+                }
+
+                if progress != nil {
+                    let pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+                    if duration > 0 {
+                        progress?(min(0.99, max(0, pts / duration)))
+                    }
+                }
+
+                if shift == .zero {
+                    input.append(sample)
+                } else if let adjusted = shifted(sample, by: shift) {
+                    input.append(adjusted)
+                }
+            }
+        }
+    }
+
+    private static func shifted(_ sample: CMSampleBuffer, by shift: CMTime) -> CMSampleBuffer? {
+        var count = 0
+        CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: 0,
+                                              arrayToFill: nil, entriesNeededOut: &count)
+        guard count > 0 else { return sample }
+
+        var timing = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+        CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: count,
+                                              arrayToFill: &timing, entriesNeededOut: &count)
+
+        for index in 0..<count {
+            timing[index].presentationTimeStamp =
+                CMTimeAdd(timing[index].presentationTimeStamp, shift)
+            if timing[index].decodeTimeStamp.isValid {
+                timing[index].decodeTimeStamp =
+                    CMTimeAdd(timing[index].decodeTimeStamp, shift)
+            }
+        }
+
+        var output: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
+                                                          sampleBuffer: sample,
+                                                          sampleTimingEntryCount: count,
+                                                          sampleTimingArray: &timing,
+                                                          sampleBufferOut: &output)
+        guard status == noErr else { return nil }
+        return output
     }
 }
