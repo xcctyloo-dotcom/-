@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "3.5"
-    static let note = "scope-fix"
+    static let version = "3.6"
+    static let note = "import-timeout"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -864,6 +864,7 @@ final class CompensateViewController: UIViewController {
     private var fileTimeout: DispatchWorkItem?
     private var fileStartedAt: Date?
     private var importFailures = 0
+    private var importTimeout: DispatchWorkItem?
 
     private lazy var shareButton: UIButton = {
         var config = UIButton.Configuration.tinted()
@@ -2119,6 +2120,19 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
             return
         }
 
+        statusLabel.text = "正在从相册导入 \(index + 1)/\(providers.count)…"
+
+        importTimeout?.cancel()
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            Log.write("import timeout at index \(index)")
+            self.importFailures += providers.count - index
+            self.applySelection(collected)
+        }
+        importTimeout = timeout
+        // 单个文件最多等 3 分钟：还在 iCloud 上的片子会卡在这里
+        DispatchQueue.main.asyncAfter(deadline: .now() + 180, execute: timeout)
+
         let provider = providers[index]
         provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { [weak self] url, _ in
             var copied: URL?
@@ -2140,6 +2154,7 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
             }
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.importTimeout?.cancel()
                 var next = collected
                 if let copied { next.append(copied) }
                 self.importProviders(providers, index: index + 1, collected: next)
