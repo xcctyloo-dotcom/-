@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "4.4"
-    static let note = "hardening"
+    static let version = "5.0"
+    static let note = "seven-pass"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -83,7 +83,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         TempCleaner.clean()
-        Log.write("launch \(BuildInfo.display)")
+        Log.write("launch \(BuildInfo.display) \(UIDevice.current.systemName) \(UIDevice.current.systemVersion) \(UIDevice.current.model)")
         AudioHub.shared.configureSession()
         return true
     }
@@ -385,6 +385,7 @@ final class VideoSyncViewController: UIViewController {
 
     private let playerLayer = AVPlayerLayer()
     private let panel = UIStackView()
+    private let emptyStack = UIStackView()
 
     private let offsetLabel = UILabel()
     private let statusLabel = UILabel()
@@ -411,6 +412,7 @@ final class VideoSyncViewController: UIViewController {
         view.backgroundColor = .black
         playerLayer.videoGravity = .resizeAspect
         view.layer.addSublayer(playerLayer)
+        buildEmptyState()
         buildPanel()
     }
 
@@ -425,6 +427,39 @@ final class VideoSyncViewController: UIViewController {
     }
 
     // MARK: UI
+
+    private func buildEmptyState() {
+        let icon = UIImageView(image: UIImage(systemName: "play.rectangle.on.rectangle"))
+        icon.tintColor = Theme.accent
+        icon.contentMode = .scaleAspectFit
+        icon.heightAnchor.constraint(equalToConstant: 56).isActive = true
+
+        let title = UILabel()
+        title.text = "还没有选视频"
+        title.font = .systemFont(ofSize: 17, weight: .semibold)
+        title.textColor = .white
+
+        let hint = UILabel()
+        hint.text = "选一个视频，画面在手机、声音走车机\n再拖滑杆把音画对齐"
+        hint.numberOfLines = 0
+        hint.textAlignment = .center
+        hint.font = .systemFont(ofSize: 14)
+        hint.textColor = .systemGray2
+
+        emptyStack.axis = .vertical
+        emptyStack.alignment = .center
+        emptyStack.spacing = 12
+        emptyStack.translatesAutoresizingMaskIntoConstraints = false
+        [icon, title, hint].forEach { emptyStack.addArrangedSubview($0) }
+        view.addSubview(emptyStack)
+
+        NSLayoutConstraint.activate([
+            emptyStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            emptyStack.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -100),
+            emptyStack.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 32),
+            emptyStack.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -32)
+        ])
+    }
 
     private func buildPanel() {
         offsetLabel.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
@@ -450,6 +485,7 @@ final class VideoSyncViewController: UIViewController {
 
         let row = UIStackView(arrangedSubviews: [
             makeButton("选视频", #selector(pickVideo)),
+            makeButton("从相册", #selector(pickFromPhotos)),
             makeButton("播放/暂停", #selector(togglePlay)),
             makeButton("回退 10s", #selector(backTen))
         ])
@@ -529,11 +565,17 @@ final class VideoSyncViewController: UIViewController {
         present(picker, animated: true)
     }
 
-    private func load(original url: URL) {
-        let dst = FileManager.default.temporaryDirectory
-            .appendingPathComponent("source.\(url.pathExtension.isEmpty ? "mp4" : url.pathExtension)")
-        try? FileManager.default.removeItem(at: dst)
-        try? FileManager.default.copyItem(at: url, to: dst)
+    private func load(original url: URL, alreadyCopied: Bool = false) {
+        let dst: URL
+        if alreadyCopied {
+            dst = url
+        } else {
+            let target = FileManager.default.temporaryDirectory
+                .appendingPathComponent("source.\(url.pathExtension.isEmpty ? "mp4" : url.pathExtension)")
+            try? FileManager.default.removeItem(at: target)
+            try? FileManager.default.copyItem(at: url, to: target)
+            dst = target
+        }
 
         let asset = AVURLAsset(url: dst)
         let player = AVPlayer(url: dst)
@@ -541,6 +583,7 @@ final class VideoSyncViewController: UIViewController {
         player.automaticallyWaitsToMinimizeStalling = false
         videoPlayer = player
         playerLayer.player = player
+        emptyStack.isHidden = true
 
         statusLabel.text = "正在分离音轨…"
         offsetSlider.value = Float(offsetMs)
@@ -702,6 +745,52 @@ extension VideoSyncViewController: UIDocumentPickerDelegate {
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         guard let url = urls.first else { return }
         load(original: url)
+    }
+}
+
+extension VideoSyncViewController: PHPickerViewControllerDelegate {
+
+    @objc fileprivate func pickFromPhotos() {
+        var config = PHPickerConfiguration()
+        config.filter = .videos
+        config.selectionLimit = 1
+        config.preferredAssetRepresentationMode = .current
+
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = self
+        present(picker, animated: true)
+    }
+
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+
+        guard let provider = results.first?.itemProvider,
+              provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) else { return }
+
+        statusLabel.text = "正在从相册取视频…"
+        provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { [weak self] url, _ in
+            guard let url else {
+                DispatchQueue.main.async {
+                    self?.statusLabel.text = "取视频失败：可能还在 iCloud，先在相册里播放一遍"
+                }
+                return
+            }
+
+            let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
+            let dst = FileManager.default.temporaryDirectory
+                .appendingPathComponent("syncs_src.\(ext)")
+            try? FileManager.default.removeItem(at: dst)
+            let copied = (try? FileManager.default.copyItem(at: url, to: dst)) != nil
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if copied {
+                    self.load(original: dst, alreadyCopied: true)
+                } else {
+                    self.statusLabel.text = "拷贝失败：空间可能不足"
+                }
+            }
+        }
     }
 }
 
@@ -901,6 +990,7 @@ final class CompensateViewController: UIViewController {
     private let valueLabel = UILabel()
     private let directionLabel = UILabel()
     private let statusLabel = UILabel()
+    private let carLabel = UILabel()
     private let learnLabel = UILabel()
     private let slider = UISlider()
     private let progressBar = UIProgressView(progressViewStyle: .default)
@@ -925,6 +1015,9 @@ final class CompensateViewController: UIViewController {
     private var importAborted = false
     private var importFailureNames: [String] = []
     private var presetButtons: [(button: UIButton, value: Double)] = []
+    private var measureButton: UIButton?
+    private var photosButton: UIButton?
+    private var filesButton: UIButton?
     private var overwriteCount = 0
 
     private lazy var shareButton: UIButton = {
@@ -939,6 +1032,7 @@ final class CompensateViewController: UIViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         refreshLearnLabel()
+        refreshCarLabel()
     }
 
     override func viewDidLoad() {
@@ -985,9 +1079,16 @@ final class CompensateViewController: UIViewController {
         statusLabel.textColor = .secondaryLabel
         statusLabel.numberOfLines = 0
 
+        carLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        carLabel.textColor = .secondaryLabel
+        carLabel.numberOfLines = 0
+
         learnLabel.font = .systemFont(ofSize: 11)
         learnLabel.textColor = .tertiaryLabel
         learnLabel.numberOfLines = 0
+        learnLabel.isUserInteractionEnabled = true
+        learnLabel.addGestureRecognizer(UILongPressGestureRecognizer(
+            target: self, action: #selector(clearSamplesTapped)))
 
         let presetRow = UIStackView(arrangedSubviews: [
             makePresetButton("−100", -100),
@@ -1010,11 +1111,21 @@ final class CompensateViewController: UIViewController {
         stack.isLayoutMarginsRelativeArrangement = true
         stack.layoutMargins = UIEdgeInsets(top: 0, left: 20, bottom: 20, right: 20)
 
+        let measureButton = makeButton("自动测量延迟", #selector(measureTapped))
+        let photosButton = makeButton("从相册选择（可多选）", #selector(pickFromPhotos))
+        let filesButton = makeButton("从文件选择（可多选）", #selector(pickVideo))
+        self.measureButton = measureButton
+        self.photosButton = photosButton
+        self.filesButton = filesButton
+
         [help, valueLabel, directionLabel, slider, presetRow,
-         makeButton("自动测量延迟", #selector(measureTapped)),
-         makeButton("从相册选择（可多选）", #selector(pickFromPhotos)),
-         makeButton("从文件选择（可多选）", #selector(pickVideo)),
-         exportButton, progressBar, statusLabel, shareButton, learnLabel].forEach { stack.addArrangedSubview($0) }
+         measureButton, photosButton, filesButton,
+         exportButton, progressBar, statusLabel, shareButton, carLabel, learnLabel]
+            .forEach { stack.addArrangedSubview($0) }
+
+        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(resetOffset))
+        doubleTap.numberOfTapsRequired = 2
+        slider.addGestureRecognizer(doubleTap)
         view.addSubview(stack)
 
         NSLayoutConstraint.activate([
@@ -1090,6 +1201,28 @@ final class CompensateViewController: UIViewController {
         return button
     }
 
+    private func refreshCarLabel() {
+        let name = OffsetStore.routeName
+        if let stored = OffsetStore.routeStored {
+            carLabel.text = String(format: "当前车机：%@ · 已存 %.0f ms", name, stored)
+        } else {
+            carLabel.text = "当前车机：\(name) · 还没为它存过偏移"
+        }
+    }
+
+    @objc private func clearSamplesTapped() {
+        guard OffsetStore.sampleCount > 0 else { return }
+        let alert = UIAlertController(title: "清除学习样本？",
+                                      message: "会删掉已记录的 \(OffsetStore.sampleCount) 组「码率 → 偏移」，规律重新开始积累。",
+                                      preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        alert.addAction(UIAlertAction(title: "清除", style: .destructive) { [weak self] _ in
+            OffsetStore.clearSamples()
+            self?.refreshLearnLabel()
+        })
+        present(alert, animated: true)
+    }
+
     private func refreshLearnLabel() {
         if let fit = OffsetStore.fit() {
             learnLabel.text = String(format: "已学 %d 组样本：码率每 +1 Mbps，补偿多 %+.1f ms", fit.count, fit.slope)
@@ -1127,6 +1260,14 @@ final class CompensateViewController: UIViewController {
     @objc private func sliderChanged() {
         offsetMs = Double(slider.value).rounded()
         refresh()
+    }
+
+    @objc private func resetOffset() {
+        offsetMs = 0
+        slider.value = 0
+        refresh()
+        OffsetStore.current = 0
+        Haptics.tap()
     }
 
     @objc private func sliderFinished() {
@@ -1239,6 +1380,7 @@ final class CompensateViewController: UIViewController {
         progressBar.isHidden = false
         progressBar.progress = 0
         setActionTitle("取消")
+        setEntryButtons(enabled: false)
         statusLabel.text = sources.count > 1 ? "准备中…共 \(sources.count) 个" : "准备中…"
 
         UIApplication.shared.isIdleTimerDisabled = true
@@ -1297,6 +1439,13 @@ final class CompensateViewController: UIViewController {
         })
     }
 
+    private func setEntryButtons(enabled: Bool) {
+        measureButton?.isEnabled = enabled
+        photosButton?.isEnabled = enabled
+        filesButton?.isEnabled = enabled
+        slider.isEnabled = enabled
+    }
+
     private func armFileWatchdog(for url: URL) {
         fileTimeout?.cancel()
         let watchdog = DispatchWorkItem { [weak self] in
@@ -1330,6 +1479,7 @@ final class CompensateViewController: UIViewController {
             }
         }
         setActionTitle("导出补偿版")
+        setEntryButtons(enabled: true)
         progressBar.isHidden = true
         UIApplication.shared.isIdleTimerDisabled = false
         endBackground()
@@ -1343,6 +1493,8 @@ final class CompensateViewController: UIViewController {
                                          offset: offsetMs)
             }
         }
+
+        Log.write("queue done ok=\(completed) fail=\(failed) overwrite=\(overwriteCount) offset=\(Int(offsetMs))")
 
         if let lastExport {
             shareButton.isHidden = false
@@ -1431,6 +1583,9 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
     private let deleteButton = UIButton(type: .system)
     private var files: [URL] = []
     private var selecting = false
+    private var sortBySize = false
+    private var sortButton: UIBarButtonItem?
+    private let emptyLabel = UILabel()
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -1440,12 +1595,34 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
                                                             target: self,
                                                             action: #selector(toggleSelecting))
 
+        let timeAction = UIAction(title: "按时间", state: .on) { [weak self] _ in
+            self?.sortBySize = false
+            self?.updateSortMenu()
+            self?.reload()
+        }
+        let sizeAction = UIAction(title: "按大小") { [weak self] _ in
+            self?.sortBySize = true
+            self?.updateSortMenu()
+            self?.reload()
+        }
+        sortButton = UIBarButtonItem(image: UIImage(systemName: "arrow.up.arrow.down"),
+                                     menu: UIMenu(title: "排序", children: [timeAction, sizeAction]))
+        navigationItem.leftBarButtonItem = sortButton
+
         table.dataSource = self
         table.delegate = self
         table.allowsMultipleSelectionDuringEditing = true
         table.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
         table.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(table)
+
+        emptyLabel.text = "还没有导出的文件\n去「补偿版导出」选几个视频"
+        emptyLabel.numberOfLines = 0
+        emptyLabel.textAlignment = .center
+        emptyLabel.font = .systemFont(ofSize: 15)
+        emptyLabel.textColor = .secondaryLabel
+        emptyLabel.frame = CGRect(x: 0, y: 0, width: 300, height: 80)
+        table.backgroundView = emptyLabel
 
         buildBar()
 
@@ -1566,18 +1743,43 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
 
     // MARK: 数据
 
+    private func updateSortMenu() {
+        let timeAction = UIAction(title: "按时间", state: sortBySize ? .off : .on) { [weak self] _ in
+            self?.sortBySize = false
+            self?.updateSortMenu()
+            self?.reload()
+        }
+        let sizeAction = UIAction(title: "按大小", state: sortBySize ? .on : .off) { [weak self] _ in
+            self?.sortBySize = true
+            self?.updateSortMenu()
+            self?.reload()
+        }
+        sortButton?.menu = UIMenu(title: "排序", children: [timeAction, sizeAction])
+    }
+
     private func reload() {
         let dir = CompensateExporter.documentsDir()
         let urls = (try? FileManager.default.contentsOfDirectory(at: dir,
                                                                  includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey])) ?? []
         files = urls.filter { $0.pathExtension.lowercased() == "mp4" }
             .sorted { a, b in
+                if sortBySize {
+                    let sa = (try? a.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                    let sb = (try? b.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                    return sa > sb
+                }
                 let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
                 let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
                 return da > db
             }
         table.reloadData()
         updateBar()
+        emptyLabel.isHidden = !files.isEmpty
+
+        let total = files.reduce(Int64(0)) { sum, url in
+            sum + Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        navigationItem.prompt = files.isEmpty ? nil : "\(files.count) 个 · \(Format.bytes(total))"
     }
 
     // MARK: UITableView
@@ -1884,6 +2086,16 @@ enum OffsetStore {
             return values[values.count / 2]
         }
         return predict(mbps: mbps)
+    }
+
+    /// 只查当前车机自己的记录，不做回退
+    static var routeStored: Double? {
+        let map = UserDefaults.standard.dictionary(forKey: mapKey) ?? [:]
+        return map[routeName] as? Double
+    }
+
+    static func clearSamples() {
+        UserDefaults.standard.removeObject(forKey: samplesKey)
     }
 
     static var summary: String {
@@ -2748,6 +2960,7 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
 
     private var files: [URL] = []
     private var baseURL: String = "未启动"
+    private let emptyLabel = UILabel()
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -2792,6 +3005,14 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
 
         table.translatesAutoresizingMaskIntoConstraints = false
 
+        emptyLabel.text = "还没有导出的视频\n先去「补偿版导出」处理几部"
+        emptyLabel.numberOfLines = 0
+        emptyLabel.textAlignment = .center
+        emptyLabel.font = .systemFont(ofSize: 15)
+        emptyLabel.textColor = .secondaryLabel
+        emptyLabel.frame = CGRect(x: 0, y: 0, width: 300, height: 80)
+        table.backgroundView = emptyLabel
+
         view.addSubview(header)
         view.addSubview(table)
 
@@ -2818,6 +3039,7 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
                                                                  includingPropertiesForKeys: [.fileSizeKey])) ?? []
         files = urls.filter { $0.pathExtension.lowercased() == "mp4" }
         table.reloadData()
+        emptyLabel.isHidden = !files.isEmpty
     }
 
     private func toggle() {
