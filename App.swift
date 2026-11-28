@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "5.8"
-    static let note = "audit3"
+    static let version = "5.9"
+    static let note = "dup-fix"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -1891,7 +1891,7 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         content.imageProperties.tintColor = Theme.accent
         content.imageProperties.maximumSize = CGSize(width: 22, height: 22)
         let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-        if let custom {
+        if custom != nil {
             content.secondaryText = url.lastPathComponent + " · " + Format.bytes(size)
             content.secondaryTextProperties.numberOfLines = 1
         } else if let info = VideoInfoCache.cached(url) {
@@ -1930,14 +1930,6 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
 
     func tableView(_ tableView: UITableView, didDeselectRowAt indexPath: IndexPath) {
         updateBar()
-    }
-
-    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-        updateSelectionButton()
-    }
-
-    func tableView(_ tableView: UITableView, didDeselectRowAt indexPath: IndexPath) {
-        updateSelectionButton()
     }
 
     func tableView(_ tableView: UITableView,
@@ -3873,11 +3865,19 @@ extension BatchPlanViewController: UITableViewDataSource, UITableViewDelegate {
         return cell
     }
 
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        updateSelectionButton()
+    }
+
+    func tableView(_ tableView: UITableView, didDeselectRowAt indexPath: IndexPath) {
+        updateSelectionButton()
+    }
+
     func tableView(_ tableView: UITableView,
                    trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
         let remove = UIContextualAction(style: .destructive, title: "移出本组") { [weak self] _, _, done in
             guard let self else { return done(false) }
-            var batch = self.batches[indexPath.section]
+            let batch = self.batches[indexPath.section]
             var urls = batch.urls
             urls.remove(at: indexPath.row)
             if urls.isEmpty {
