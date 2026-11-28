@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "7.3"
-    static let note = "rotate-icon"
+    static let version = "7.8"
+    static let note = "layout"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -399,12 +399,17 @@ final class VideoSyncViewController: UIViewController {
     private let emptyStack = UIStackView()
     private var playButton: UIButton?
     private var rotateItem: UIBarButtonItem?
+    private var blurView: UIVisualEffectView?
+    private var blurConstraints: [NSLayoutConstraint] = []
+    private var lastLandscape = false
+    private var controlsHidden = false
     private var backButton: UIButton?
 
     private let offsetLabel = UILabel()
     private let statusLabel = UILabel()
     private let timeLabel = UILabel()
     private let videoInfoLabel = UILabel()
+    private let tipLabel = UILabel()
     private let seekBar = UISlider()
     private let offsetSlider = UISlider()
 
@@ -442,11 +447,17 @@ final class VideoSyncViewController: UIViewController {
         item.accessibilityLabel = "切换横竖屏"
         rotateItem = item
         navigationItem.rightBarButtonItem = item
+
+        let tap = UITapGestureRecognizer(target: self, action: #selector(toggleControls))
+        tap.delegate = self
+        tap.cancelsTouchesInView = false
+        view.addGestureRecognizer(tap)
     }
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         playerLayer.frame = view.bounds
+        updatePanelLayout()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -497,6 +508,11 @@ final class VideoSyncViewController: UIViewController {
         timeLabel.textColor = .white
         timeLabel.textAlignment = .right
 
+        tipLabel.text = "轻点画面可隐藏控制"
+        tipLabel.font = .systemFont(ofSize: 11)
+        tipLabel.textColor = .systemGray3
+        tipLabel.textAlignment = .center
+
         videoInfoLabel.font = .systemFont(ofSize: 11)
         videoInfoLabel.textColor = .systemGray2
         videoInfoLabel.numberOfLines = 0
@@ -522,15 +538,22 @@ final class VideoSyncViewController: UIViewController {
         playButton = play
         backButton = back
 
-        let row = UIStackView(arrangedSubviews: [
+        let playRow = UIStackView(arrangedSubviews: [play, back])
+        playRow.axis = .horizontal
+        playRow.distribution = .fillEqually
+        playRow.spacing = 8
+
+        let fileRow = UIStackView(arrangedSubviews: [
             makeButton("从文件", #selector(pickVideo)),
-            makeButton("从相册", #selector(pickFromPhotos)),
-            play,
-            back
+            makeButton("从相册", #selector(pickFromPhotos))
         ])
-        row.axis = .horizontal
-        row.distribution = .fillEqually
-        row.spacing = 8
+        fileRow.axis = .horizontal
+        fileRow.distribution = .fillEqually
+        fileRow.spacing = 8
+
+        let divider = UIView()
+        divider.backgroundColor = .separator
+        divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
 
         let fine = UIStackView(arrangedSubviews: [
             makeButton("−10ms", #selector(minusTapped)),
@@ -543,23 +566,27 @@ final class VideoSyncViewController: UIViewController {
         panel.axis = .vertical
         panel.spacing = 10
         panel.translatesAutoresizingMaskIntoConstraints = false
-        [offsetLabel, offsetSlider, fine, seekBar, timeLabel, row, videoInfoLabel, statusLabel]
+        [videoInfoLabel,
+         seekBar, timeLabel, playRow,
+         divider,
+         offsetLabel, offsetSlider, fine,
+         fileRow,
+         statusLabel, tipLabel]
             .forEach { panel.addArrangedSubview($0) }
 
         let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
         blur.translatesAutoresizingMaskIntoConstraints = false
         blur.contentView.addSubview(panel)
         view.addSubview(blur)
+        blurView = blur
 
         NSLayoutConstraint.activate([
-            blur.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            blur.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            blur.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             panel.leadingAnchor.constraint(equalTo: blur.leadingAnchor, constant: 16),
             panel.trailingAnchor.constraint(equalTo: blur.trailingAnchor, constant: -16),
             panel.topAnchor.constraint(equalTo: blur.topAnchor, constant: 14),
             panel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -10)
         ])
+        updatePanelLayout()
 
         refreshOffsetLabel()
     }
@@ -647,6 +674,11 @@ final class VideoSyncViewController: UIViewController {
             videoInfoLabel.text = info.summary
         } else {
             videoInfoLabel.text = nil
+        }
+
+        if !UserDefaults.standard.bool(forKey: "hideTipShown") {
+            UserDefaults.standard.set(true, forKey: "hideTipShown")
+            showHint("轻点画面可隐藏控制，再点恢复")
         }
 
         statusLabel.text = "正在分离音轨…"
@@ -842,6 +874,72 @@ final class VideoSyncViewController: UIViewController {
         }
     }
 
+    /// 竖屏：贴底整宽；横屏：贴右 46% 宽，给画面留位置
+    private func updatePanelLayout() {
+        guard let blur = blurView else { return }
+        let landscape = view.bounds.width > view.bounds.height
+        guard landscape != lastLandscape || blurConstraints.isEmpty else { return }
+        lastLandscape = landscape
+
+        NSLayoutConstraint.deactivate(blurConstraints)
+        var fresh: [NSLayoutConstraint] = [
+            blur.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ]
+        if landscape {
+            fresh.append(blur.trailingAnchor.constraint(equalTo: view.trailingAnchor))
+            fresh.append(blur.topAnchor.constraint(equalTo: view.topAnchor))
+            fresh.append(blur.widthAnchor.constraint(equalTo: view.widthAnchor, multiplier: 0.46))
+        } else {
+            fresh.append(blur.leadingAnchor.constraint(equalTo: view.leadingAnchor))
+            fresh.append(blur.trailingAnchor.constraint(equalTo: view.trailingAnchor))
+        }
+        NSLayoutConstraint.activate(fresh)
+        blurConstraints = fresh
+    }
+
+    @objc private func toggleControls() {
+        controlsHidden.toggle()
+        let hidden = controlsHidden
+
+        UIView.animate(withDuration: 0.22) {
+            self.blurView?.alpha = hidden ? 0 : 1
+            self.emptyStack.alpha = hidden ? 0 : 1
+        }
+        navigationController?.setNavigationBarHidden(hidden, animated: true)
+        Haptics.tap()
+
+        showHint(hidden ? "控制已隐藏 · 轻点画面恢复" : "控制已显示 · 轻点画面隐藏")
+    }
+
+    /// 隐藏后提示一下怎么回来，避免卡在全屏
+    private func showHint(_ text: String) {
+        let label = UILabel()
+        label.text = text
+        label.font = .systemFont(ofSize: 14, weight: .medium)
+        label.textColor = .white
+        label.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        label.textAlignment = .center
+        label.layer.cornerRadius = 16
+        label.clipsToBounds = true
+        label.alpha = 0
+        label.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(label)
+
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            label.widthAnchor.constraint(equalToConstant: 260),
+            label.heightAnchor.constraint(equalToConstant: 36)
+        ])
+
+        UIView.animate(withDuration: 0.2) { label.alpha = 1 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            UIView.animate(withDuration: 0.4, animations: { label.alpha = 0 }) { _ in
+                label.removeFromSuperview()
+            }
+        }
+    }
+
     private func updatePlayButtons() {
         let ready = audioPlayer != nil
         playButton?.isEnabled = ready
@@ -853,6 +951,14 @@ final class VideoSyncViewController: UIViewController {
         let current = audioPlayer?.currentTime ?? 0
         let duration = audioPlayer?.duration ?? 0
         timeLabel.text = "\(Format.time(current)) / \(Format.time(duration))"
+    }
+}
+
+extension VideoSyncViewController: UIGestureRecognizerDelegate {
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        guard let touched = touch.view else { return true }
+        if let blur = blurView, touched.isDescendant(of: blur) { return false }
+        return true
     }
 }
 
