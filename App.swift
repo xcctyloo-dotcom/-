@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "9.0"
-    static let note = "final"
+    static let version = "9.2"
+    static let note = "polish-7"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -456,6 +456,11 @@ final class VideoSyncViewController: UIViewController {
         tap.delegate = self
         tap.cancelsTouchesInView = false
         view.addGestureRecognizer(tap)
+
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePanelPan))
+        pan.delegate = self
+        pan.maximumNumberOfTouches = 1
+        blurView?.addGestureRecognizer(pan)
     }
 
     override func viewDidLayoutSubviews() {
@@ -936,8 +941,45 @@ final class VideoSyncViewController: UIViewController {
     }
 
     @objc private func toggleControls() {
-        controlsHidden.toggle()
-        let hidden = controlsHidden
+        setControlsHidden(!controlsHidden)
+    }
+
+    @objc private func handlePanelPan(_ gesture: UIPanGestureRecognizer) {
+        guard let blur = blurView else { return }
+        let landscape = view.bounds.width > view.bounds.height
+        let translation = gesture.translation(in: view)
+        let progress = landscape ? max(0, translation.x) : max(0, translation.y)
+
+        switch gesture.state {
+        case .changed:
+            blur.transform = landscape
+                ? CGAffineTransform(translationX: progress, y: 0)
+                : CGAffineTransform(translationX: 0, y: progress)
+            blur.alpha = max(0.6, 1 - progress / 320)
+        case .ended, .cancelled:
+            let threshold: CGFloat = 90
+            if progress > threshold {
+                UIView.animate(withDuration: 0.2, animations: {
+                    blur.transform = landscape
+                        ? CGAffineTransform(translationX: self.view.bounds.width, y: 0)
+                        : CGAffineTransform(translationX: 0, y: self.view.bounds.height)
+                }) { _ in
+                    blur.transform = .identity
+                    self.setControlsHidden(true)
+                }
+            } else {
+                UIView.animate(withDuration: 0.22) {
+                    blur.transform = .identity
+                    blur.alpha = 1
+                }
+            }
+        default:
+            break
+        }
+    }
+
+    private func setControlsHidden(_ hidden: Bool) {
+        controlsHidden = hidden
 
         UIView.animate(withDuration: 0.22) {
             self.blurView?.alpha = hidden ? 0 : 1
@@ -988,14 +1030,28 @@ final class VideoSyncViewController: UIViewController {
     private func updateTimeLabel() {
         let current = audioPlayer?.currentTime ?? 0
         let duration = audioPlayer?.duration ?? 0
-        timeLabel.text = "\(Format.time(current)) / \(Format.time(duration))"
+        let remain = max(0, duration - current)
+        if duration > 0 {
+            timeLabel.text = "\(Format.time(current)) / \(Format.time(duration)) · 剩 \(Format.time(remain))"
+        } else {
+            timeLabel.text = "\(Format.time(current)) / \(Format.time(duration))"
+        }
     }
 }
 
 extension VideoSyncViewController: UIGestureRecognizerDelegate {
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
         guard let touched = touch.view else { return true }
-        if let blur = blurView, touched.isDescendant(of: blur) { return false }
+
+        // 轻点：只认面板以外的区域（点了画面才切换）
+        if gestureRecognizer is UITapGestureRecognizer {
+            if let blur = blurView, touched.isDescendant(of: blur) { return false }
+            return true
+        }
+
+        // 拖动：只认面板背景，滑块和按钮上的拖动留给控件本身
+        guard let blur = blurView, touched.isDescendant(of: blur) else { return false }
+        if touched is UIControl || touched.superview is UIControl { return false }
         return true
     }
 }
@@ -2069,24 +2125,28 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
 
     private func makeSortMenu() -> UIMenu {
         let time = UIAction(title: "按时间", state: (!sortBySize && !sortByName) ? .on : .off) { [weak self] _ in
+            Haptics.tap()
             self?.sortBySize = false
             self?.sortByName = false
             self?.updateSortMenu()
             self?.reload()
         }
         let size = UIAction(title: "按大小", state: sortBySize ? .on : .off) { [weak self] _ in
+            Haptics.tap()
             self?.sortBySize = true
             self?.sortByName = false
             self?.updateSortMenu()
             self?.reload()
         }
         let name = UIAction(title: "按名称", state: sortByName ? .on : .off) { [weak self] _ in
+            Haptics.tap()
             self?.sortByName = true
             self?.sortBySize = false
             self?.updateSortMenu()
             self?.reload()
         }
-        return UIMenu(title: "排序", children: [time, size, name])
+        let current = sortByName ? "按名称" : (sortBySize ? "按大小" : "按时间")
+        return UIMenu(title: "排序 · 当前\(current)", children: [time, size, name])
     }
 
     private func updateSortMenu() {
@@ -2198,6 +2258,7 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
             alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in done(false) })
             alert.addAction(UIAlertAction(title: "保存", style: .default) { _ in
                 TitleStore.set(alert.textFields?.first?.text ?? "", for: url)
+                Haptics.success()
                 self.reload()
                 done(true)
             })
@@ -2273,6 +2334,11 @@ final class AboutViewController: UIViewController {
 
         每次导出记录「码率 → 偏移」，累积 3 部以上且码率跨度够，就会拟合出规律，
         选新片时自动给出参考值。码率分四档：低 <4、中 4-10、高 10-20、超高 >20 Mbps。
+
+        诊断与维护
+
+        主菜单最下面。这里能看当前状态（车机、样本数、端口、日志大小），
+        复制诊断摘要、分享日志、清理文件。出问题时先来这里，比猜快。
         """
         // 短行当标题，其余当正文，避免整页同字号
         if let raw = text.text {
@@ -4305,6 +4371,13 @@ final class DiagnosticsViewController: UIViewController, UITableViewDataSource, 
         table.reloadData()
     }
 
+    private func copySummary() {
+        let text = statusRows.map { "\($0.0)：\($0.1)" }.joined(separator: "\n")
+        UIPasteboard.general.string = text
+        Haptics.success()
+        alert("已复制", "诊断摘要已放到剪贴板，可以直接粘给我")
+    }
+
     private func shareLog() {
         let url = Log.fileURL()
         guard FileManager.default.fileExists(atPath: url.path) else {
@@ -4360,7 +4433,7 @@ final class DiagnosticsViewController: UIViewController, UITableViewDataSource, 
     func numberOfSections(in tableView: UITableView) -> Int { 2 }
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        section == 0 ? statusRows.count : 3
+        section == 0 ? statusRows.count : 4
     }
 
     func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
@@ -4379,9 +4452,9 @@ final class DiagnosticsViewController: UIViewController, UITableViewDataSource, 
             cell.selectionStyle = .none
             cell.accessoryType = .none
         } else {
-            let actions = ["分享日志", "清空日志", "删除全部导出文件"]
+            let actions = ["复制诊断摘要", "分享日志", "清空日志", "删除全部导出文件"]
             content.text = actions[indexPath.row]
-            content.textProperties.color = indexPath.row == 2 ? .systemRed : .label
+            content.textProperties.color = indexPath.row == 3 ? .systemRed : .label
             cell.selectionStyle = .default
             cell.accessoryType = .none
         }
@@ -4394,8 +4467,9 @@ final class DiagnosticsViewController: UIViewController, UITableViewDataSource, 
         tableView.deselectRow(at: indexPath, animated: true)
         guard indexPath.section == 1 else { return }
         switch indexPath.row {
-        case 0: shareLog()
-        case 1: clearLog()
+        case 0: copySummary()
+        case 1: shareLog()
+        case 2: clearLog()
         default: clearExports()
         }
     }
