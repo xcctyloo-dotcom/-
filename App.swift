@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "9.4"
-    static let note = "final-check"
+    static let version = "9.7"
+    static let note = "final-97"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -438,6 +438,7 @@ final class VideoSyncViewController: UIViewController {
     private let videoInfoLabel = UILabel()
     private let tipLabel = UILabel()
     private let grabber = UIView()
+    private var hintLabel: UILabel?
     private let seekBar = UISlider()
     private let offsetSlider = UISlider()
 
@@ -717,6 +718,7 @@ final class VideoSyncViewController: UIViewController {
             if !supported {
                 statusLabel.text = "这个视频是 \(info.codec) 编码，系统播放器不支持。\n先用电脑转成 H.264/HEVC 的 MP4 再来。"
                 Log.write("unsupported codec: \(info.codec) \(dst.lastPathComponent)")
+                emptyStack.isHidden = false
                 return
             }
             if info.width >= 6000 || info.height >= 3500 {
@@ -726,6 +728,7 @@ final class VideoSyncViewController: UIViewController {
         } else {
             statusLabel.text = "读不出这个文件的视频轨，可能封装不完整。"
             Log.write("no video track: \(dst.lastPathComponent)")
+            emptyStack.isHidden = false
             return
         }
 
@@ -989,14 +992,19 @@ final class VideoSyncViewController: UIViewController {
                 : CGAffineTransform(translationX: 0, y: progress)
             blur.alpha = max(0.6, 1 - progress / 320)
         case .ended, .cancelled:
-            let threshold: CGFloat = 90
+            let extent = landscape ? view.bounds.width : view.bounds.height
+            let threshold = max(60, min(110, extent * 0.12))
             if progress > threshold {
                 UIView.animate(withDuration: 0.2, animations: {
                     blur.transform = landscape
                         ? CGAffineTransform(translationX: self.view.bounds.width, y: 0)
                         : CGAffineTransform(translationX: 0, y: self.view.bounds.height)
                 }) { _ in
-                    blur.transform = .identity
+                    // 先置透明再复位，否则复位那一帧会闪回原位
+                    UIView.performWithoutAnimation {
+                        blur.alpha = 0
+                        blur.transform = .identity
+                    }
                     self.setControlsHidden(true)
                 }
             } else {
@@ -1015,6 +1023,7 @@ final class VideoSyncViewController: UIViewController {
 
         UIView.animate(withDuration: 0.22) {
             self.blurView?.alpha = hidden ? 0 : 1
+            self.blurView?.transform = .identity
             self.emptyStack.alpha = hidden ? 0 : 1
         }
         navigationController?.setNavigationBarHidden(hidden, animated: true)
@@ -1025,6 +1034,9 @@ final class VideoSyncViewController: UIViewController {
 
     /// 隐藏后提示一下怎么回来，避免卡在全屏
     private func showHint(_ text: String) {
+        hintLabel?.removeFromSuperview()
+        hintLabel = nil
+
         let label = UILabel()
         label.text = text
         label.font = .systemFont(ofSize: 14, weight: .medium)
@@ -1036,6 +1048,7 @@ final class VideoSyncViewController: UIViewController {
         label.alpha = 0
         label.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(label)
+        hintLabel = label
 
         NSLayoutConstraint.activate([
             label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -1629,6 +1642,7 @@ final class CompensateViewController: UIViewController {
 
         if !exporting {
             setActionTitle(sources.count > 1 ? "导出补偿版（\(sources.count) 个）" : "导出补偿版")
+            actionButton?.isEnabled = !sources.isEmpty
         }
     }
 
@@ -4047,6 +4061,7 @@ final class BatchPlanViewController: UIViewController {
     private let table = UITableView(frame: .zero, style: .insetGrouped)
     private let bar = UIStackView()
     private var exportButton: UIButton?
+    private var removeButtonRef: UIButton?
 
     private var items: [PlanItem] = []
     private var sections: [(title: String, rows: [Int])] = []
@@ -4092,7 +4107,9 @@ final class BatchPlanViewController: UIViewController {
         let removeButton = UIButton(type: .system)
         removeButton.setTitle("移出清单（不删文件）", for: .normal)
         removeButton.tintColor = .systemRed
+        removeButton.isEnabled = false
         removeButton.addAction(UIAction { [weak self] _ in self?.removeSelected() }, for: .touchUpInside)
+        removeButtonRef = removeButton
 
         let export = UIButton(type: .system)
         export.setTitle("导出选中", for: .normal)
@@ -4239,10 +4256,28 @@ final class BatchPlanViewController: UIViewController {
         }
     }
 
+    private func toggleSelection(in section: Int) {
+        guard section < sections.count else { return }
+        let rows = sections[section].rows
+        guard !rows.isEmpty else { return }
+
+        let paths = (0..<rows.count).map { IndexPath(row: $0, section: section) }
+        let selected = table.indexPathsForSelectedRows ?? []
+        let allSelected = paths.allSatisfy { selected.contains($0) }
+
+        if allSelected {
+            paths.forEach { table.deselectRow(at: $0, animated: false) }
+        } else {
+            paths.forEach { table.selectRow(at: $0, animated: false, scrollPosition: .none) }
+        }
+        updateSelectionButton()
+    }
+
     private func updateSelectionButton() {
         let count = table.indexPathsForSelectedRows?.count ?? 0
         exportButton?.setTitle(count > 0 ? "导出选中（\(count)）" : "导出选中", for: .normal)
         exportButton?.isEnabled = count > 0
+        removeButtonRef?.isEnabled = count > 0
     }
 
     /// 点一行：单独调这个文件的偏移
@@ -4287,8 +4322,16 @@ extension BatchPlanViewController: UITableViewDataSource, UITableViewDelegate {
         label.font = .systemFont(ofSize: 13, weight: .semibold)
         label.textColor = Theme.accent
 
-        let row = UIStackView(arrangedSubviews: [label, UIView()])
+        let selectAll = UIButton(type: .system)
+        selectAll.setTitle("全选", for: .normal)
+        selectAll.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
+        selectAll.addAction(UIAction { [weak self] _ in
+            self?.toggleSelection(in: section)
+        }, for: .touchUpInside)
+
+        let row = UIStackView(arrangedSubviews: [label, UIView(), selectAll])
         row.axis = .horizontal
+        row.alignment = .center
         row.layoutMargins = UIEdgeInsets(top: 6, left: 20, bottom: 6, right: 20)
         row.isLayoutMarginsRelativeArrangement = true
         return row
