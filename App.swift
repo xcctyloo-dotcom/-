@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "9.2"
-    static let note = "polish-7"
+    static let version = "9.4"
+    static let note = "final-check"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -345,19 +345,33 @@ final class AudioHub {
         guard !configured else { return }
         configured = true
 
+        // 启动时只设置类别，不激活会话、不写 Now Playing：
+        // 否则控制中心会一直挂着本 App，哪怕什么都没播
         do {
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
-            try AVAudioSession.sharedInstance().setActive(true)
         } catch {
             NSLog("audio session: \(error)")
         }
         installRemote()
-        refreshNowPlaying()
+        observeLifecycle()
+        clearNowPlaying()
+    }
+
+    private func observeLifecycle() {
+        // 退到后台就停：测试音不该在后台一直滴滴
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.stop()
+        }
     }
 
     func toggle() { isPlaying ? stop() : play() }
 
     func play() {
+        try? AVAudioSession.sharedInstance().setActive(true)
         if player == nil { player = makePlayer() }
         player?.numberOfLoops = -1
         player?.play()
@@ -385,11 +399,21 @@ final class AudioHub {
     }
 
     private func refreshNowPlaying() {
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = [
-            MPMediaItemPropertyTitle: "CarPlayCast",
-            MPMediaItemPropertyArtist: isPlaying ? "播放中" : "已停止",
-            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0
-        ]
+        if isPlaying {
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = [
+                MPMediaItemPropertyTitle: "CarPlayCast",
+                MPMediaItemPropertyArtist: "播放中",
+                MPNowPlayingInfoPropertyPlaybackRate: 1.0
+            ]
+            MPNowPlayingInfoCenter.default().playbackState = .playing
+        } else {
+            clearNowPlaying()
+        }
+    }
+
+    private func clearNowPlaying() {
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
     }
 }
 
@@ -461,6 +485,14 @@ final class VideoSyncViewController: UIViewController {
         pan.delegate = self
         pan.maximumNumberOfTouches = 1
         blurView?.addGestureRecognizer(pan)
+
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.stopAll()
+        }
     }
 
     override func viewDidLayoutSubviews() {
