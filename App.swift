@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "7.8"
-    static let note = "layout"
+    static let version = "9.0"
+    static let note = "final"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -183,6 +183,9 @@ final class MenuViewController: UIViewController {
         }
 
         addSection("说明")
+        addCard("诊断与维护", "查看状态、导出日志、清理文件", "stethoscope") { [weak self] in
+            self?.navigationController?.pushViewController(DiagnosticsViewController(), animated: true)
+        }
         addCard("这个 App 能做什么", "三种模式的区别与各自的上限", "questionmark.circle") { [weak self] in
             self?.navigationController?.pushViewController(AboutViewController(), animated: true)
         }
@@ -410,6 +413,7 @@ final class VideoSyncViewController: UIViewController {
     private let timeLabel = UILabel()
     private let videoInfoLabel = UILabel()
     private let tipLabel = UILabel()
+    private let grabber = UIView()
     private let seekBar = UISlider()
     private let offsetSlider = UISlider()
 
@@ -566,12 +570,32 @@ final class VideoSyncViewController: UIViewController {
         panel.axis = .vertical
         panel.spacing = 10
         panel.translatesAutoresizingMaskIntoConstraints = false
-        [videoInfoLabel,
+        grabber.backgroundColor = UIColor(white: 1, alpha: 0.28)
+        grabber.layer.cornerRadius = 2.5
+        grabber.heightAnchor.constraint(equalToConstant: 5).isActive = true
+        grabber.widthAnchor.constraint(equalToConstant: 40).isActive = true
+
+        let grabberBox = UIView()
+        grabberBox.addSubview(grabber)
+        grabber.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            grabber.centerXAnchor.constraint(equalTo: grabberBox.centerXAnchor),
+            grabber.topAnchor.constraint(equalTo: grabberBox.topAnchor),
+            grabber.bottomAnchor.constraint(equalTo: grabberBox.bottomAnchor, constant: -4)
+        ])
+
+        let spacer = UIView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+
+        [grabberBox,
+         videoInfoLabel,
          seekBar, timeLabel, playRow,
          divider,
          offsetLabel, offsetSlider, fine,
          fileRow,
-         statusLabel, tipLabel]
+         statusLabel, tipLabel,
+         spacer]
             .forEach { panel.addArrangedSubview($0) }
 
         let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
@@ -594,14 +618,19 @@ final class VideoSyncViewController: UIViewController {
     private func makeButton(_ title: String, _ action: Selector) -> UIButton {
         var config = UIButton.Configuration.tinted()
         config.title = title
+        config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+            var outgoing = incoming
+            outgoing.font = .systemFont(ofSize: 13, weight: .medium)
+            return outgoing
+        }
         config.cornerStyle = .capsule
         config.baseBackgroundColor = Theme.accent
         config.baseForegroundColor = Theme.accent
-        config.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10)
+        config.contentInsets = NSDirectionalEdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8)
 
         let b = UIButton(configuration: config)
         b.addTarget(self, action: action, for: .touchUpInside)
-        b.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        b.heightAnchor.constraint(equalToConstant: 34).isActive = true
         return b
     }
 
@@ -888,13 +917,22 @@ final class VideoSyncViewController: UIViewController {
         if landscape {
             fresh.append(blur.trailingAnchor.constraint(equalTo: view.trailingAnchor))
             fresh.append(blur.topAnchor.constraint(equalTo: view.topAnchor))
-            fresh.append(blur.widthAnchor.constraint(equalTo: view.widthAnchor, multiplier: 0.46))
+            fresh.append(blur.widthAnchor.constraint(equalTo: view.widthAnchor, multiplier: 0.42))
+            fresh.append(blur.widthAnchor.constraint(lessThanOrEqualToConstant: 380))
         } else {
             fresh.append(blur.leadingAnchor.constraint(equalTo: view.leadingAnchor))
             fresh.append(blur.trailingAnchor.constraint(equalTo: view.trailingAnchor))
         }
         NSLayoutConstraint.activate(fresh)
         blurConstraints = fresh
+
+        // 竖屏是底部弹层（上圆角 + 抓手），横屏是侧边全高（直角、无抓手）
+        UIView.animate(withDuration: 0.25) {
+            blur.layer.cornerRadius = landscape ? 0 : 22
+            blur.layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+            blur.clipsToBounds = true
+            self.grabber.alpha = landscape ? 0 : 1
+        }
     }
 
     @objc private func toggleControls() {
@@ -1549,6 +1587,7 @@ final class CompensateViewController: UIViewController {
         if exporting {
             cancelling = true
             pendingQueue.removeAll()
+            leftoverPlan.removeAll()
             CompensateExporter.cancel()
             statusLabel.text = "正在取消…"
             return
@@ -1610,6 +1649,7 @@ final class CompensateViewController: UIViewController {
                                       preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "取消", style: .cancel) { [weak self] _ in
             self?.pendingQueue.removeAll()
+            self?.leftoverPlan.removeAll()
             self?.statusLabel.text = "已取消，未导出"
         })
         alert.addAction(UIAlertAction(title: "覆盖", style: .default) { [weak self] _ in
@@ -1651,6 +1691,16 @@ final class CompensateViewController: UIViewController {
         }
 
         let url = sources[currentIndex]
+
+        // 文件可能在排队期间被删掉或被系统清出临时目录
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            failed += 1
+            Log.write("source missing: \(url.lastPathComponent)")
+            currentIndex += 1
+            runNext()
+            return
+        }
+
         let startedAt = Date()
         fileStartedAt = Date()
 
@@ -1757,8 +1807,9 @@ final class CompensateViewController: UIViewController {
 
         // 这一轮导完，把没导的重新摆到面板上，方便继续调偏移
         if !leftoverPlan.isEmpty {
-            let rest = leftoverPlan
+            let rest = leftoverPlan.filter { FileManager.default.fileExists(atPath: $0.url.path) }
             leftoverPlan = []
+            guard !rest.isEmpty else { return }
             Log.write("reopen plan with \(rest.count) left")
             presentPlan(rest)
             return
@@ -1782,6 +1833,11 @@ final class CompensateViewController: UIViewController {
         } else {
             statusLabel.text = wasCancelled ? "已取消" : "导出失败"
         }
+
+        // 汇总已经生成，再清空选择：临时源文件已删，避免再点导出全部失败
+        sources = []
+        sourceSizes = []
+        refresh()
     }
 
     private func updateProgress(overall: Double, current: Double) {
@@ -2367,6 +2423,10 @@ enum OffsetStore {
 
     static var sampleCount: Int { rawMap().count }
 
+    static var routeCount: Int {
+        (UserDefaults.standard.dictionary(forKey: mapKey) ?? [:]).count
+    }
+
     /// 最小二乘：偏移 ≈ slope × 码率 + intercept
     static func fit() -> Fit? {
         let points = samples()
@@ -2458,6 +2518,11 @@ enum Log {
     static func fileURL() -> URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("debug.log")
+    }
+
+    static func size() -> Int64 {
+        let values = try? fileURL().resourceValues(forKeys: [.fileSizeKey])
+        return Int64(values?.fileSize ?? 0)
     }
 
     static func write(_ message: String) {
@@ -4182,6 +4247,156 @@ extension BatchPlanViewController: UITableViewDataSource, UITableViewDelegate {
                 self?.editOffset(indexPath)
             }
             return UIMenu(title: "", children: [edit])
+        }
+    }
+}
+
+// MARK: - 诊断与维护
+
+final class DiagnosticsViewController: UIViewController, UITableViewDataSource, UITableViewDelegate {
+
+    private let table = UITableView(frame: .zero, style: .insetGrouped)
+    private var statusRows: [(String, String)] = []
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "诊断与维护"
+        view.backgroundColor = .systemGroupedBackground
+
+        table.dataSource = self
+        table.delegate = self
+        table.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
+        table.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(table)
+
+        NSLayoutConstraint.activate([
+            table.topAnchor.constraint(equalTo: view.topAnchor),
+            table.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            table.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            table.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+        ])
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        refresh()
+    }
+
+    private func refresh() {
+        let dir = CompensateExporter.documentsDir()
+        let files = ((try? FileManager.default.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.fileSizeKey])) ?? [])
+            .filter { $0.pathExtension.lowercased() == "mp4" }
+        let total = files.reduce(Int64(0)) { sum, url in
+            sum + Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+
+        statusRows = [
+            ("版本", BuildInfo.display),
+            ("设备", "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion) · \(UIDevice.current.model)"),
+            ("当前音频输出", OffsetStore.routeName),
+            ("已保存车机偏移", "\(OffsetStore.routeCount) 台"),
+            ("学习样本", "\(OffsetStore.sampleCount) 组"),
+            ("导出文件", "\(files.count) 个 · \(Format.bytes(total))"),
+            ("本地服务端口", LocalFileServer.shared.isRunning ? "\(LocalFileServer.shared.port)（运行中）" : "未启动"),
+            ("日志大小", Format.bytes(Log.size()))
+        ]
+        table.reloadData()
+    }
+
+    private func shareLog() {
+        let url = Log.fileURL()
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            alert("还没有日志", "用一阵子之后再来看")
+            return
+        }
+        let share = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        share.popoverPresentationController?.sourceView = table
+        present(share, animated: true)
+    }
+
+    private func clearLog() {
+        let alert = UIAlertController(title: "清空日志？", message: "会删掉 debug.log，出问题时就没有记录可查了。", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        alert.addAction(UIAlertAction(title: "清空", style: .destructive) { [weak self] _ in
+            try? FileManager.default.removeItem(at: Log.fileURL())
+            self?.refresh()
+        })
+        present(alert, animated: true)
+    }
+
+    private func clearExports() {
+        let dir = CompensateExporter.documentsDir()
+        let files = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension.lowercased() == "mp4" }
+        guard !files.isEmpty else {
+            alert("没有可清理的文件", "「已导出」目前是空的")
+            return
+        }
+
+        let alert = UIAlertController(title: "删除全部 \(files.count) 个导出文件？",
+                                      message: "文件会被真正删除，删了就找不回来了。",
+                                      preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        alert.addAction(UIAlertAction(title: "全部删除", style: .destructive) { [weak self] _ in
+            files.forEach {
+                TitleStore.set("", for: $0)
+                try? FileManager.default.removeItem(at: $0)
+            }
+            self?.refresh()
+        })
+        present(alert, animated: true)
+    }
+
+    private func alert(_ title: String, _ message: String) {
+        let controller = UIAlertController(title: title, message: message, preferredStyle: .alert)
+        controller.addAction(UIAlertAction(title: "好", style: .default))
+        present(controller, animated: true)
+    }
+
+    // MARK: UITableView
+
+    func numberOfSections(in tableView: UITableView) -> Int { 2 }
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        section == 0 ? statusRows.count : 3
+    }
+
+    func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
+        section == 0 ? "当前状态" : "维护"
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "cell", for: indexPath)
+        var content = cell.defaultContentConfiguration()
+
+        if indexPath.section == 0 {
+            let row = statusRows[indexPath.row]
+            content.text = row.0
+            content.secondaryText = row.1
+            content.prefersSideBySideTextAndSecondaryText = true
+            cell.selectionStyle = .none
+            cell.accessoryType = .none
+        } else {
+            let actions = ["分享日志", "清空日志", "删除全部导出文件"]
+            content.text = actions[indexPath.row]
+            content.textProperties.color = indexPath.row == 2 ? .systemRed : .label
+            cell.selectionStyle = .default
+            cell.accessoryType = .none
+        }
+
+        cell.contentConfiguration = content
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        guard indexPath.section == 1 else { return }
+        switch indexPath.row {
+        case 0: shareLog()
+        case 1: clearLog()
+        default: clearExports()
         }
     }
 }
