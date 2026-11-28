@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "6.2"
-    static let note = "row-info"
+    static let version = "7.0"
+    static let note = "final-ish"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -119,6 +119,8 @@ final class MenuViewController: UIViewController {
 
     private let scroll = UIScrollView()
     private let stack = UIStackView()
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .portrait }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -386,6 +388,8 @@ final class VideoSyncViewController: UIViewController {
     private let playerLayer = AVPlayerLayer()
     private let panel = UIStackView()
     private let emptyStack = UIStackView()
+    private var playButton: UIButton?
+    private var backButton: UIButton?
 
     private let offsetLabel = UILabel()
     private let statusLabel = UILabel()
@@ -405,6 +409,8 @@ final class VideoSyncViewController: UIViewController {
         get { OffsetStore.current }
         set { OffsetStore.current = newValue }
     }
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .allButUpsideDown }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -440,7 +446,7 @@ final class VideoSyncViewController: UIViewController {
         title.textColor = .white
 
         let hint = UILabel()
-        hint.text = "选一个视频，画面在手机、声音走车机\n再拖滑杆把音画对齐"
+        hint.text = "选一个视频，画面在手机、声音走车机\n再拖滑杆把音画对齐\n\n只支持 MP4/MOV 的 H.264、HEVC"
         hint.numberOfLines = 0
         hint.textAlignment = .center
         hint.font = .systemFont(ofSize: 14)
@@ -483,11 +489,18 @@ final class VideoSyncViewController: UIViewController {
         seekBar.addTarget(self, action: #selector(seekChanged), for: .valueChanged)
         seekBar.addTarget(self, action: #selector(seekEnded), for: [.touchUpInside, .touchUpOutside, .touchCancel])
 
+        let play = makeButton("播放", #selector(togglePlay))
+        let back = makeButton("回退 10s", #selector(backTen))
+        play.isEnabled = false
+        back.isEnabled = false
+        playButton = play
+        backButton = back
+
         let row = UIStackView(arrangedSubviews: [
-            makeButton("选视频", #selector(pickVideo)),
+            makeButton("从文件", #selector(pickVideo)),
             makeButton("从相册", #selector(pickFromPhotos)),
-            makeButton("播放/暂停", #selector(togglePlay)),
-            makeButton("回退 10s", #selector(backTen))
+            play,
+            back
         ])
         row.axis = .horizontal
         row.distribution = .fillEqually
@@ -578,6 +591,25 @@ final class VideoSyncViewController: UIViewController {
         }
 
         let asset = AVURLAsset(url: dst)
+
+        // 先体检：不支持的封装/编码直接说清楚，别让它黑屏转圈
+        if let info = VideoInfo.load(dst) {
+            let supported = ["H.264", "HEVC"].contains(info.codec)
+            if !supported {
+                statusLabel.text = "这个视频是 \(info.codec) 编码，系统播放器不支持。\n先用电脑转成 H.264/HEVC 的 MP4 再来。"
+                Log.write("unsupported codec: \(info.codec) \(dst.lastPathComponent)")
+                return
+            }
+            if info.width >= 6000 || info.height >= 3500 {
+                statusLabel.text = "这是 \(info.width)×\(info.height)，iPhone 最高只能解 4K，可能黑屏或卡顿。"
+                Log.write("oversized video: \(info.width)x\(info.height)")
+            }
+        } else {
+            statusLabel.text = "读不出这个文件的视频轨，可能封装不完整。"
+            Log.write("no video track: \(dst.lastPathComponent)")
+            return
+        }
+
         let player = AVPlayer(url: dst)
         player.isMuted = true
         player.automaticallyWaitsToMinimizeStalling = false
@@ -620,6 +652,7 @@ final class VideoSyncViewController: UIViewController {
                 guard let player = try? AVAudioPlayer(contentsOf: out) else { return }
                 player.prepareToPlay()
                 self?.audioPlayer = player
+                self?.updatePlayButtons()
                 self?.seekBar.maximumValue = Float(player.duration)
                 self?.statusLabel.text = "就绪 · 拖动上面的进度条可以跳转"
             }
@@ -634,6 +667,7 @@ final class VideoSyncViewController: UIViewController {
         } else {
             startPlayback(x: 0)
         }
+        updatePlayButtons()
     }
 
     private func startPlayback(x: Double) {
@@ -663,6 +697,7 @@ final class VideoSyncViewController: UIViewController {
         ticker = nil
         audioPlayer?.pause()
         videoPlayer?.pause()
+        updatePlayButtons()
     }
 
     @objc private func backTen() {
@@ -721,17 +756,27 @@ final class VideoSyncViewController: UIViewController {
 
         guard audio.isPlaying else { return }
         let now = Date()
-        guard now.timeIntervalSince(lastCorrection) > 2 else { return }
+        guard now.timeIntervalSince(lastCorrection) > 5 else { return }
         lastCorrection = now
 
         let audioTimeline = audio.currentTime - offsetMs / 1000
         let videoTime = video.currentTime().seconds
         guard videoTime.isFinite else { return }
-        if abs(audioTimeline - videoTime) > 0.12 {
+        // 只在明显跑偏时纠，且允许跳到关键帧：
+        // 精确 seek 要回退解码，4K 上就是可见的卡顿
+        if abs(audioTimeline - videoTime) > 0.25 {
             video.seek(to: CMTime(seconds: max(0, audioTimeline), preferredTimescale: 600),
-                       toleranceBefore: .zero, toleranceAfter: .zero)
-            statusLabel.text = "已自动纠偏一次"
+                       toleranceBefore: .positiveInfinity,
+                       toleranceAfter: .positiveInfinity)
+            statusLabel.text = "已自动纠偏（允许关键帧）"
         }
+    }
+
+    private func updatePlayButtons() {
+        let ready = audioPlayer != nil
+        playButton?.isEnabled = ready
+        backButton?.isEnabled = ready
+        playButton?.setTitle(audioPlayer?.isPlaying == true ? "暂停" : "播放", for: .normal)
     }
 
     private func updateTimeLabel() {
@@ -1030,6 +1075,8 @@ final class CompensateViewController: UIViewController {
         button.addAction(UIAction { [weak self] _ in self?.presentShare() }, for: .touchUpInside)
         return button
     }()
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .portrait }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
@@ -1634,6 +1681,8 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
     private var selectItem: UIBarButtonItem?
     private let emptyLabel = UILabel()
 
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .portrait }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "已导出"
@@ -1947,6 +1996,8 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
 // MARK: - 说明
 
 final class AboutViewController: UIViewController {
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .portrait }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -2348,7 +2399,7 @@ final class Calibrator {
     static let shared = Calibrator()
 
     /// 三次咔哒的起播时间（相对录音开始）
-    private static let clickTimes: [Double] = [0.35, 0.85, 1.35]
+    private static let clickTimes: [Double] = [0.3, 0.7, 1.1, 1.5, 1.9]
 
     enum MeasureError: LocalizedError {
         case noPermission
@@ -2452,7 +2503,7 @@ final class Calibrator {
             }
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) { [weak self] in
             self?.stopAndAnalyze()
         }
     }
@@ -2489,9 +2540,17 @@ final class Calibrator {
         deltas.sort()
         let median = deltas[deltas.count / 2]
 
+        // 剔除离群样本：和中间值差太多的不要
+        let filtered = deltas.filter { abs($0 - median) <= 0.04 }
+        guard filtered.count >= 2 else {
+            finish(.failure(MeasureError.noSignal))
+            return
+        }
+        let stable = filtered[filtered.count / 2]
+
         // 扣掉麦克风输入链路的固定延迟
         let inputLatency = min(AVAudioSession.sharedInstance().inputLatency, 0.1)
-        let ms = (median - inputLatency) * 1000
+        let ms = (stable - inputLatency) * 1000
 
         if ms < 20 || ms > 400 {
             finish(.failure(MeasureError.outOfRange(ms)))
@@ -3095,6 +3154,8 @@ final class LocalServerViewController: UIViewController, UITableViewDataSource, 
     private var baseURL: String = "未启动"
     private let emptyLabel = UILabel()
 
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .portrait }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "本地播放"
@@ -3658,6 +3719,8 @@ final class BatchPlanViewController: UIViewController {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .portrait }
 
     override func viewDidLoad() {
         super.viewDidLoad()
