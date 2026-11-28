@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "6.1"
-    static let note = "safety"
+    static let version = "6.2"
+    static let note = "row-info"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -3743,6 +3743,15 @@ final class BatchPlanViewController: UIViewController {
         return items[index]
     }
 
+    private func indexPath(for url: URL) -> IndexPath? {
+        for (section, group) in sections.enumerated() {
+            for (row, index) in group.rows.enumerated() where index < items.count && items[index].url == url {
+                return IndexPath(row: row, section: section)
+            }
+        }
+        return nil
+    }
+
     // MARK: 操作
 
     @objc private func cancelTapped() {
@@ -3900,8 +3909,20 @@ extension BatchPlanViewController: UITableViewDataSource, UITableViewDelegate {
         content.imageProperties.tintColor = Theme.accent
 
         let size = Int64((try? item.url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-        content.secondaryText = String(format: "%.0f ms · %@", item.offset, Format.bytes(size))
-        content.secondaryTextProperties.numberOfLines = 1
+        if let info = VideoInfoCache.cached(item.url) {
+            content.secondaryText = String(format: "%.0f ms · %@\n%@",
+                                           item.offset, Format.bytes(size), info.summary)
+        } else {
+            content.secondaryText = String(format: "%.0f ms · %@\n读取参数中…",
+                                           item.offset, Format.bytes(size))
+            let url = item.url
+            VideoInfoCache.loadAsync(for: url) { [weak self] info in
+                guard info != nil, let self, let path = self.indexPath(for: url) else { return }
+                self.table.reloadRows(at: [path], with: .none)
+            }
+        }
+        content.secondaryTextProperties.numberOfLines = 2
+        content.secondaryTextProperties.font = .systemFont(ofSize: 12)
         cell.contentConfiguration = content
         return cell
     }
