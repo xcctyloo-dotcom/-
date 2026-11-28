@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "7.2"
-    static let note = "rotate-button"
+    static let version = "7.3"
+    static let note = "rotate-icon"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -432,10 +432,13 @@ final class VideoSyncViewController: UIViewController {
         buildEmptyState()
         buildPanel()
 
-        let item = UIBarButtonItem(image: UIImage(systemName: "rectangle.landscape"),
+        let item = UIBarButtonItem(image: UIImage(systemName: "arrow.up.left.and.arrow.down.right"),
                                    style: .plain,
                                    target: self,
                                    action: #selector(toggleOrientation))
+        if item.image == nil {
+            item.title = "横屏"
+        }
         item.accessibilityLabel = "切换横竖屏"
         rotateItem = item
         navigationItem.rightBarButtonItem = item
@@ -821,7 +824,14 @@ final class VideoSyncViewController: UIViewController {
         guard let scene = view.window?.windowScene else { return }
         let isLandscape = scene.interfaceOrientation.isLandscape
         // 显示“切换后可去往的方向”
-        rotateItem?.image = UIImage(systemName: isLandscape ? "rectangle.portrait" : "rectangle.landscape")
+        let name = isLandscape ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right"
+        if let image = UIImage(systemName: name) {
+            rotateItem?.image = image
+            rotateItem?.title = nil
+        } else {
+            rotateItem?.image = nil
+            rotateItem?.title = isLandscape ? "竖屏" : "横屏"
+        }
         rotateItem?.accessibilityLabel = isLandscape ? "切换到竖屏" : "切换到横屏"
     }
 
