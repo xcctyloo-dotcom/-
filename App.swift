@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "5.2"
-    static let note = "nav-fix2"
+    static let version = "5.8"
+    static let note = "audit3"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -1013,6 +1013,7 @@ final class CompensateViewController: UIViewController {
     private var importFailures = 0
     private var importTimeout: DispatchWorkItem?
     private var importAborted = false
+    private var pendingQueue: [([URL], Double)] = []
     private var importFailureNames: [String] = []
     private var presetButtons: [(button: UIButton, value: Double)] = []
     private var measureButton: UIButton?
@@ -1150,6 +1151,63 @@ final class CompensateViewController: UIViewController {
         return button
     }
 
+    private func presentPlan(_ batches: [BatchPlanViewController.Batch], attempt: Int = 0) {
+        guard !batches.isEmpty else { return }
+
+        // 相册/文件选择器刚 dismiss 时直接 present 会失败，等一下再试
+        if presentedViewController != nil {
+            guard attempt < 5 else {
+                Log.write("presentPlan aborted: something still presented")
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                self?.presentPlan(batches, attempt: attempt + 1)
+            }
+            return
+        }
+
+        let plan = BatchPlanViewController(batches: batches)
+        plan.onExport = { [weak self] chosen in
+            self?.startBatches(chosen)
+        }
+        plan.onCancel = { [weak self] in
+            self?.statusLabel.text = "已取消分批，可以手动选片再导"
+        }
+        let nav = UINavigationController(rootViewController: plan)
+        present(nav, animated: true)
+    }
+
+    private func startBatches(_ chosen: [BatchPlanViewController.Batch]) {
+        pendingQueue = chosen.map { ($0.urls, $0.offset) }
+        Log.write("plan export \(chosen.count) batches")
+        runNextBatch()
+    }
+
+    private func runNextBatch() {
+        guard !pendingQueue.isEmpty else { return }
+        let next = pendingQueue.removeFirst()
+
+        sources = next.0
+        sourceSizes = next.0.map {
+            Int64((try? $0.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+        offsetMs = next.1
+        slider.value = Float(next.1)
+        refresh()
+
+        let remaining = pendingQueue.count
+        statusLabel.text = remaining > 0
+            ? "本批 \(sources.count) 个 · 后面还有 \(remaining) 批"
+            : "本批 \(sources.count) 个"
+
+        // 面板可能还在关闭动画里，稍等再弹确认
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.confirmOverwrite { [weak self] in
+                self?.startQueue()
+            }
+        }
+    }
+
     private func promptGrouping(groups: [VideoInfo.Category: [URL]],
                                  rates: [VideoInfo.Category: [Double]]) {
         guard let biggest = groups.max(by: { $0.value.count < $1.value.count }) else { return }
@@ -1168,19 +1226,27 @@ final class CompensateViewController: UIViewController {
             message: summary.joined(separator: " · ") + "\n\n混着导会有一半不同步。建议先导「\(category.rawValue)」这 \(list.count) 个，偏移用 \(Int(suggested)) ms。",
             preferredStyle: .alert)
 
-        alert.addAction(UIAlertAction(title: "只导这 \(list.count) 个", style: .default) { [weak self] _ in
-            guard let self else { return }
-            self.sources = list
-            self.sourceSizes = list.map {
-                Int64((try? $0.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-            }
-            self.offsetMs = suggested
-            self.slider.value = Float(suggested)
-            self.refresh()
-            let total = self.sourceSizes.reduce(0, +)
-            self.statusLabel.text = "已选 \(list.count) 个（\(category.rawValue)）· \(Format.bytes(total))\n偏移 \(Int(suggested)) ms，可以点导出了"
-        })
-        alert.addAction(UIAlertAction(title: "全部一起导", style: .cancel))
+        // 每一档都给一个入口，自己挑哪组、哪档
+        for (key, group) in groups.sorted(by: { $0.value.count > $1.value.count }) {
+            let average = (rates[key] ?? []).reduce(0, +) / Double(max(1, group.count))
+            let value = OffsetStore.suggestion(forMbps: average) ?? offsetMs
+            alert.addAction(UIAlertAction(
+                title: "只导「\(key.rawValue)」\(group.count) 个 · \(Int(value)) ms",
+                style: .default) { [weak self] _ in
+                    guard let self else { return }
+                    self.sources = group
+                    self.sourceSizes = group.map {
+                        Int64((try? $0.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+                    }
+                    self.offsetMs = value
+                    self.slider.value = Float(value)
+                    self.refresh()
+                    let total = self.sourceSizes.reduce(0, +)
+                    self.statusLabel.text = "已选 \(group.count) 个（\(key.rawValue)）· \(Format.bytes(total))\n偏移 \(Int(value)) ms，可以点导出了"
+                })
+        }
+        alert.addAction(UIAlertAction(title: "全部一起导", style: .default))
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
         present(alert, animated: true)
     }
 
@@ -1299,6 +1365,7 @@ final class CompensateViewController: UIViewController {
     @objc private func runExport() {
         if exporting {
             cancelling = true
+            pendingQueue.removeAll()
             CompensateExporter.cancel()
             statusLabel.text = "正在取消…"
             return
@@ -1358,7 +1425,10 @@ final class CompensateViewController: UIViewController {
         let alert = UIAlertController(title: "会覆盖 \(existing.count) 个已有文件",
                                       message: message,
                                       preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "取消", style: .cancel))
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { [weak self] _ in
+            self?.pendingQueue.removeAll()
+            self?.statusLabel.text = "已取消，未导出"
+        })
         alert.addAction(UIAlertAction(title: "覆盖", style: .default) { [weak self] _ in
             self?.overwriteCount = existing.count
             completion()
@@ -1496,6 +1566,12 @@ final class CompensateViewController: UIViewController {
 
         Log.write("queue done ok=\(completed) fail=\(failed) overwrite=\(overwriteCount) offset=\(Int(offsetMs))")
 
+        if !pendingQueue.isEmpty {
+            Log.write("continue next batch, remaining \(pendingQueue.count)")
+            runNextBatch()
+            return
+        }
+
         if let lastExport {
             shareButton.isHidden = false
             var config = shareButton.configuration
@@ -1584,6 +1660,7 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
     private var files: [URL] = []
     private var selecting = false
     private var sortBySize = false
+    private var sortByName = false
     private var sortButton: UIBarButtonItem?
     private var selectItem: UIBarButtonItem?
     private let emptyLabel = UILabel()
@@ -1597,18 +1674,8 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
                                          action: #selector(toggleSelecting))
         self.selectItem = selectItem
 
-        let timeAction = UIAction(title: "按时间", state: .on) { [weak self] _ in
-            self?.sortBySize = false
-            self?.updateSortMenu()
-            self?.reload()
-        }
-        let sizeAction = UIAction(title: "按大小") { [weak self] _ in
-            self?.sortBySize = true
-            self?.updateSortMenu()
-            self?.reload()
-        }
         let sort = UIBarButtonItem(image: UIImage(systemName: "arrow.up.arrow.down"),
-                                     menu: UIMenu(title: "排序", children: [timeAction, sizeAction]))
+                                     menu: makeSortMenu())
         sortButton = sort
         // 放右侧，左侧留给系统返回键
         navigationItem.rightBarButtonItems = [selectItem, sort]
@@ -1734,7 +1801,10 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
                                       preferredStyle: .actionSheet)
         alert.addAction(UIAlertAction(title: "删除", style: .destructive) { [weak self] _ in
             guard let self else { return }
-            urls.forEach { try? FileManager.default.removeItem(at: $0) }
+            urls.forEach {
+                TitleStore.set("", for: $0)
+                try? FileManager.default.removeItem(at: $0)
+            }
             self.selecting = false
             self.table.setEditing(false, animated: true)
             self.selectItem?.title = "选择"
@@ -1747,18 +1817,30 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
 
     // MARK: 数据
 
-    private func updateSortMenu() {
-        let timeAction = UIAction(title: "按时间", state: sortBySize ? .off : .on) { [weak self] _ in
+    private func makeSortMenu() -> UIMenu {
+        let time = UIAction(title: "按时间", state: (!sortBySize && !sortByName) ? .on : .off) { [weak self] _ in
+            self?.sortBySize = false
+            self?.sortByName = false
+            self?.updateSortMenu()
+            self?.reload()
+        }
+        let size = UIAction(title: "按大小", state: sortBySize ? .on : .off) { [weak self] _ in
+            self?.sortBySize = true
+            self?.sortByName = false
+            self?.updateSortMenu()
+            self?.reload()
+        }
+        let name = UIAction(title: "按名称", state: sortByName ? .on : .off) { [weak self] _ in
+            self?.sortByName = true
             self?.sortBySize = false
             self?.updateSortMenu()
             self?.reload()
         }
-        let sizeAction = UIAction(title: "按大小", state: sortBySize ? .on : .off) { [weak self] _ in
-            self?.sortBySize = true
-            self?.updateSortMenu()
-            self?.reload()
-        }
-        sortButton?.menu = UIMenu(title: "排序", children: [timeAction, sizeAction])
+        return UIMenu(title: "排序", children: [time, size, name])
+    }
+
+    private func updateSortMenu() {
+        sortButton?.menu = makeSortMenu()
     }
 
     private func reload() {
@@ -1767,6 +1849,11 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
                                                                  includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey])) ?? []
         files = urls.filter { $0.pathExtension.lowercased() == "mp4" }
             .sorted { a, b in
+                if sortByName {
+                    let na = TitleStore.title(for: a) ?? a.lastPathComponent
+                    let nb = TitleStore.title(for: b) ?? b.lastPathComponent
+                    return na.localizedStandardCompare(nb) == .orderedAscending
+                }
                 if sortBySize {
                     let sa = (try? a.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
                     let sb = (try? b.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
@@ -1796,14 +1883,18 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         let cell = tableView.dequeueReusableCell(withIdentifier: "cell", for: indexPath)
         let url = files[indexPath.row]
         var content = cell.defaultContentConfiguration()
-        content.text = url.lastPathComponent
+        let custom = TitleStore.title(for: url)
+        content.text = custom ?? url.lastPathComponent
         content.textProperties.numberOfLines = 1
         content.textProperties.lineBreakMode = .byTruncatingMiddle
         content.image = UIImage(systemName: "film")
         content.imageProperties.tintColor = Theme.accent
         content.imageProperties.maximumSize = CGSize(width: 22, height: 22)
         let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
-        if let info = VideoInfoCache.cached(url) {
+        if let custom {
+            content.secondaryText = url.lastPathComponent + " · " + Format.bytes(size)
+            content.secondaryTextProperties.numberOfLines = 1
+        } else if let info = VideoInfoCache.cached(url) {
             content.secondaryText = info.shortSummary + " · " + Format.bytes(size)
             content.secondaryTextProperties.numberOfLines = 1
         } else {
@@ -1841,16 +1932,46 @@ final class ExportedFilesViewController: UIViewController, UITableViewDataSource
         updateBar()
     }
 
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        updateSelectionButton()
+    }
+
+    func tableView(_ tableView: UITableView, didDeselectRowAt indexPath: IndexPath) {
+        updateSelectionButton()
+    }
+
     func tableView(_ tableView: UITableView,
                    trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
         guard !selecting else { return nil }
+        let rename = UIContextualAction(style: .normal, title: "改名") { [weak self] _, _, done in
+            guard let self else { return done(false) }
+            let url = self.files[indexPath.row]
+            let alert = UIAlertController(title: "设置显示标题",
+                                          message: url.lastPathComponent,
+                                          preferredStyle: .alert)
+            alert.addTextField { field in
+                field.text = TitleStore.title(for: url)
+                field.placeholder = "例如：星晴"
+            }
+            alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in done(false) })
+            alert.addAction(UIAlertAction(title: "保存", style: .default) { _ in
+                TitleStore.set(alert.textFields?.first?.text ?? "", for: url)
+                self.reload()
+                done(true)
+            })
+            self.present(alert, animated: true)
+        }
+        rename.backgroundColor = Theme.accent
+
         let delete = UIContextualAction(style: .destructive, title: "删除") { [weak self] _, _, done in
             guard let self else { return done(false) }
-            try? FileManager.default.removeItem(at: self.files[indexPath.row])
+            let url = self.files[indexPath.row]
+            TitleStore.set("", for: url)
+            try? FileManager.default.removeItem(at: url)
             self.reload()
             done(true)
         }
-        return UISwipeActionsConfiguration(actions: [delete])
+        return UISwipeActionsConfiguration(actions: [delete, rename])
     }
 }
 
@@ -2108,6 +2229,29 @@ enum OffsetStore {
         return map.map { "\($0.key)：\(Int(($0.value as? Double) ?? 0)) ms" }
             .sorted()
             .joined(separator: "\n")
+    }
+}
+
+// MARK: - 显示标题
+
+/// 只改列表里显示的名字，不动真实文件名，避免破坏本地播放链接
+enum TitleStore {
+    private static let key = "displayTitles"
+
+    static func title(for url: URL) -> String? {
+        let map = UserDefaults.standard.dictionary(forKey: key) ?? [:]
+        return map[url.lastPathComponent] as? String
+    }
+
+    static func set(_ title: String, for url: URL) {
+        var map = UserDefaults.standard.dictionary(forKey: key) ?? [:]
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            map.removeValue(forKey: url.lastPathComponent)
+        } else {
+            map[url.lastPathComponent] = trimmed
+        }
+        UserDefaults.standard.set(map, forKey: key)
     }
 }
 
@@ -2573,6 +2717,10 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
                 lines.append("画面 \(info.summary)")
             }
             statusLabel.text = lines.joined(separator: "\n")
+
+            // 单个也进分批面板：可以只导这一个，或先放着
+            let title = info?.category.rawValue ?? "单个视频"
+            presentPlan([BatchPlanViewController.Batch(title: title, urls: [first], offset: offsetMs)])
         } else if urls.count > 1 {
             var groups: [VideoInfo.Category: [URL]] = [:]
             var rates: [VideoInfo.Category: [Double]] = [:]
@@ -2602,8 +2750,22 @@ extension CompensateViewController: PHPickerViewControllerDelegate {
             }
             statusLabel.text = text
 
-            if groups.count > 1 {
-                promptGrouping(groups: groups, rates: rates)
+            if true {
+                var batches: [BatchPlanViewController.Batch] = []
+                for category in order where groups[category] != nil {
+                    let list = groups[category] ?? []
+                    let average = (rates[category] ?? []).reduce(0, +) / Double(max(1, list.count))
+                    let value = OffsetStore.suggestion(forMbps: average) ?? offsetMs
+                    batches.append(BatchPlanViewController.Batch(title: category.rawValue,
+                                                                 urls: list,
+                                                                 offset: value))
+                }
+                if batches.isEmpty {
+                    batches.append(BatchPlanViewController.Batch(title: "未分类",
+                                                                 urls: urls,
+                                                                 offset: offsetMs))
+                }
+                presentPlan(batches)
             }
         } else if !importFailureNames.isEmpty {
             statusLabel.text = "全部导入失败，共 \(importFailureNames.count) 个：\n"
@@ -3496,5 +3658,236 @@ enum Remuxer {
                                                           sampleBufferOut: &output)
         guard status == noErr else { return nil }
         return output
+    }
+}
+
+// MARK: - 分批面板
+
+/// 导入后先在这里看清单：按码率分组，一组一组导，自己决定顺序
+final class BatchPlanViewController: UIViewController {
+
+    struct Batch {
+        let title: String
+        let urls: [URL]
+        let offset: Double
+    }
+
+    /// 交给外面执行导出；参数是这一组的文件和偏移
+    var onExport: (([Batch]) -> Void)?
+    var onCancel: (() -> Void)?
+
+    private let table = UITableView(frame: .zero, style: .insetGrouped)
+    private let bar = UIStackView()
+    private var batches: [Batch] = []
+    private var exportButton: UIButton?
+
+    init(batches: [Batch]) {
+        self.batches = batches
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        title = "分批导出"
+        view.backgroundColor = .systemGroupedBackground
+
+        navigationItem.leftBarButtonItem = UIBarButtonItem(title: "取消", style: .plain,
+                                                           target: self, action: #selector(cancelTapped))
+        navigationItem.rightBarButtonItem = UIBarButtonItem(title: "全部按顺序", style: .done,
+                                                            target: self, action: #selector(exportAll))
+
+        table.dataSource = self
+        table.delegate = self
+        table.allowsMultipleSelectionDuringEditing = true
+        table.setEditing(true, animated: false)
+        table.register(UITableViewCell.self, forCellReuseIdentifier: "cell")
+        table.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(table)
+
+        let removeButton = UIButton(type: .system)
+        removeButton.setTitle("移出选中", for: .normal)
+        removeButton.tintColor = .systemRed
+        removeButton.addAction(UIAction { [weak self] _ in self?.removeSelected() }, for: .touchUpInside)
+
+        let exportButton = UIButton(type: .system)
+        exportButton.setTitle("导出选中", for: .normal)
+        exportButton.tintColor = Theme.accent
+        exportButton.addAction(UIAction { [weak self] _ in self?.exportSelected() }, for: .touchUpInside)
+        self.exportButton = exportButton
+
+        bar.axis = .horizontal
+        bar.distribution = .fillEqually
+        bar.backgroundColor = .secondarySystemGroupedBackground
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        bar.addArrangedSubview(removeButton)
+        bar.addArrangedSubview(exportButton)
+        view.addSubview(bar)
+
+        NSLayoutConstraint.activate([
+            table.topAnchor.constraint(equalTo: view.topAnchor),
+            table.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            table.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            table.bottomAnchor.constraint(equalTo: bar.topAnchor),
+
+            bar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            bar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            bar.heightAnchor.constraint(equalToConstant: 50)
+        ])
+    }
+
+    @objc private func cancelTapped() {
+        onCancel?()
+        dismiss(animated: true)
+    }
+
+    @objc private func exportAll() {
+        guard !batches.isEmpty else { return }
+        onExport?(batches)
+        dismiss(animated: true)
+    }
+
+    private func export(_ batch: Batch) {
+        onExport?([batch])
+        dismiss(animated: true)
+    }
+
+    private func exportSelected() {
+        let selected = table.indexPathsForSelectedRows ?? []
+        guard !selected.isEmpty else { return }
+
+        var result: [Batch] = []
+        for (section, batch) in batches.enumerated() {
+            let urls = selected
+                .filter { $0.section == section }
+                .sorted { $0.row < $1.row }
+                .compactMap { $0.row < batch.urls.count ? batch.urls[$0.row] : nil }
+            if !urls.isEmpty {
+                result.append(Batch(title: batch.title, urls: urls, offset: batch.offset))
+            }
+        }
+        guard !result.isEmpty else { return }
+        onExport?(result)
+        dismiss(animated: true)
+    }
+
+    private func removeSelected() {
+        let selected = Set((table.indexPathsForSelectedRows ?? []).map { "\($0.section)-\($0.row)" })
+        guard !selected.isEmpty else { return }
+
+        var rebuilt: [Batch] = []
+        for (section, batch) in batches.enumerated() {
+            let urls = batch.urls.enumerated().compactMap { index, url in
+                selected.contains("\(section)-\(index)") ? nil : url
+            }
+            if !urls.isEmpty {
+                rebuilt.append(Batch(title: batch.title, urls: urls, offset: batch.offset))
+            }
+        }
+        batches = rebuilt
+        table.reloadData()
+        updateSelectionButton()
+
+        if batches.isEmpty {
+            onCancel?()
+            dismiss(animated: true)
+        }
+    }
+
+    private func updateSelectionButton() {
+        let count = table.indexPathsForSelectedRows?.count ?? 0
+        exportButton?.setTitle(count > 0 ? "导出选中（\(count)）" : "导出选中", for: .normal)
+        exportButton?.isEnabled = count > 0
+    }
+
+    private func remove(batchAt index: Int) {
+        batches.remove(at: index)
+        if batches.isEmpty {
+            onCancel?()
+            dismiss(animated: true)
+        } else {
+            table.reloadData()
+        }
+    }
+}
+
+extension BatchPlanViewController: UITableViewDataSource, UITableViewDelegate {
+
+    func numberOfSections(in tableView: UITableView) -> Int {
+        batches.count
+    }
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        batches[section].urls.count
+    }
+
+    func tableView(_ tableView: UITableView, viewForHeaderInSection section: Int) -> UIView? {
+        let batch = batches[section]
+        let label = UILabel()
+        label.text = "\(batch.title) · \(batch.urls.count) 个 · \(Int(batch.offset)) ms"
+        label.font = .systemFont(ofSize: 13, weight: .semibold)
+        label.textColor = Theme.accent
+
+        let button = UIButton(type: .system)
+        button.setTitle("导这批", for: .normal)
+        button.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
+        button.addAction(UIAction { [weak self] _ in
+            self?.export(batch)
+        }, for: .touchUpInside)
+
+        let row = UIStackView(arrangedSubviews: [label, UIView(), button])
+        row.axis = .horizontal
+        row.alignment = .center
+        row.layoutMargins = UIEdgeInsets(top: 6, left: 20, bottom: 6, right: 20)
+        row.isLayoutMarginsRelativeArrangement = true
+        return row
+    }
+
+    func tableView(_ tableView: UITableView, heightForHeaderInSection section: Int) -> CGFloat {
+        40
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "cell", for: indexPath)
+        let url = batches[indexPath.section].urls[indexPath.row]
+
+        var content = cell.defaultContentConfiguration()
+        let custom = TitleStore.title(for: url)
+        content.text = custom ?? url.lastPathComponent
+        content.textProperties.numberOfLines = 1
+        content.textProperties.lineBreakMode = .byTruncatingMiddle
+        content.image = UIImage(systemName: "film")
+        content.imageProperties.tintColor = Theme.accent
+
+        let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        if let custom {
+            content.secondaryText = url.lastPathComponent + " · " + Format.bytes(size)
+        } else if let info = VideoInfoCache.cached(url) {
+            content.secondaryText = info.shortSummary + " · " + Format.bytes(size)
+        } else {
+            content.secondaryText = Format.bytes(size)
+        }
+        cell.contentConfiguration = content
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView,
+                   trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
+        let remove = UIContextualAction(style: .destructive, title: "移出本组") { [weak self] _, _, done in
+            guard let self else { return done(false) }
+            var batch = self.batches[indexPath.section]
+            var urls = batch.urls
+            urls.remove(at: indexPath.row)
+            if urls.isEmpty {
+                self.remove(batchAt: indexPath.section)
+            } else {
+                self.batches[indexPath.section] = Batch(title: batch.title, urls: urls, offset: batch.offset)
+                self.table.reloadSections([indexPath.section], with: .automatic)
+            }
+            done(true)
+        }
+        return UISwipeActionsConfiguration(actions: [remove])
     }
 }
