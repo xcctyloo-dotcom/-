@@ -10,8 +10,8 @@ import UniformTypeIdentifiers
 
 enum BuildInfo {
     /// 每次发新包改这里，主菜单底部和日志里都能看到
-    static let version = "7.0"
-    static let note = "final-ish"
+    static let version = "7.2"
+    static let note = "rotate-button"
     static var display: String { "v\(version) · \(note)" }
 }
 
@@ -107,13 +107,22 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
                options connectionOptions: UIScene.ConnectionOptions) {
         guard let windowScene = scene as? UIWindowScene else { return }
         let window = UIWindow(windowScene: windowScene)
-        window.rootViewController = UINavigationController(rootViewController: MenuViewController())
+        window.rootViewController = RotatingNavigationController(rootViewController: MenuViewController())
         window.makeKeyAndVisible()
         self.window = window
     }
 }
 
 // MARK: - 主菜单
+
+/// UINavigationController 默认不透传方向给子页面，
+/// 这里显式转发，视频同步页才能真正横屏
+final class RotatingNavigationController: UINavigationController {
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
+        topViewController?.supportedInterfaceOrientations ?? .portrait
+    }
+    override var shouldAutorotate: Bool { true }
+}
 
 final class MenuViewController: UIViewController {
 
@@ -389,11 +398,13 @@ final class VideoSyncViewController: UIViewController {
     private let panel = UIStackView()
     private let emptyStack = UIStackView()
     private var playButton: UIButton?
+    private var rotateItem: UIBarButtonItem?
     private var backButton: UIButton?
 
     private let offsetLabel = UILabel()
     private let statusLabel = UILabel()
     private let timeLabel = UILabel()
+    private let videoInfoLabel = UILabel()
     private let seekBar = UISlider()
     private let offsetSlider = UISlider()
 
@@ -420,6 +431,14 @@ final class VideoSyncViewController: UIViewController {
         view.layer.addSublayer(playerLayer)
         buildEmptyState()
         buildPanel()
+
+        let item = UIBarButtonItem(image: UIImage(systemName: "rectangle.landscape"),
+                                   style: .plain,
+                                   target: self,
+                                   action: #selector(toggleOrientation))
+        item.accessibilityLabel = "切换横竖屏"
+        rotateItem = item
+        navigationItem.rightBarButtonItem = item
     }
 
     override func viewDidLayoutSubviews() {
@@ -475,6 +494,10 @@ final class VideoSyncViewController: UIViewController {
         timeLabel.textColor = .white
         timeLabel.textAlignment = .right
 
+        videoInfoLabel.font = .systemFont(ofSize: 11)
+        videoInfoLabel.textColor = .systemGray2
+        videoInfoLabel.numberOfLines = 0
+
         statusLabel.font = .systemFont(ofSize: 12)
         statusLabel.textColor = .systemGray
         statusLabel.numberOfLines = 0
@@ -517,7 +540,7 @@ final class VideoSyncViewController: UIViewController {
         panel.axis = .vertical
         panel.spacing = 10
         panel.translatesAutoresizingMaskIntoConstraints = false
-        [offsetLabel, offsetSlider, fine, seekBar, timeLabel, row, statusLabel]
+        [offsetLabel, offsetSlider, fine, seekBar, timeLabel, row, videoInfoLabel, statusLabel]
             .forEach { panel.addArrangedSubview($0) }
 
         let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
@@ -616,6 +639,12 @@ final class VideoSyncViewController: UIViewController {
         videoPlayer = player
         playerLayer.player = player
         emptyStack.isHidden = true
+
+        if let info = VideoInfo.load(dst) {
+            videoInfoLabel.text = info.summary
+        } else {
+            videoInfoLabel.text = nil
+        }
 
         statusLabel.text = "正在分离音轨…"
         offsetSlider.value = Float(offsetMs)
@@ -769,6 +798,37 @@ final class VideoSyncViewController: UIViewController {
                        toleranceBefore: .positiveInfinity,
                        toleranceAfter: .positiveInfinity)
             statusLabel.text = "已自动纠偏（允许关键帧）"
+        }
+    }
+
+    @objc private func toggleOrientation() {
+        guard let scene = view.window?.windowScene else { return }
+        let isLandscape = scene.interfaceOrientation.isLandscape
+        let mask: UIInterfaceOrientationMask = isLandscape ? .portrait : .landscapeRight
+
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
+            Log.write("rotate failed: \(error.localizedDescription)")
+        }
+        setNeedsUpdateOfSupportedInterfaceOrientations()
+        Haptics.tap()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.refreshRotateItem()
+        }
+    }
+
+    private func refreshRotateItem() {
+        guard let scene = view.window?.windowScene else { return }
+        let isLandscape = scene.interfaceOrientation.isLandscape
+        // 显示“切换后可去往的方向”
+        rotateItem?.image = UIImage(systemName: isLandscape ? "rectangle.portrait" : "rectangle.landscape")
+        rotateItem?.accessibilityLabel = isLandscape ? "切换到竖屏" : "切换到横屏"
+    }
+
+    override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+            self?.refreshRotateItem()
         }
     }
 
@@ -1221,7 +1281,7 @@ final class CompensateViewController: UIViewController {
         plan.onCancel = { [weak self] in
             self?.statusLabel.text = "已取消分批，可以手动选片再导"
         }
-        let nav = UINavigationController(rootViewController: plan)
+        let nav = RotatingNavigationController(rootViewController: plan)
         present(nav, animated: true)
     }
 
